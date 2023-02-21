@@ -1,0 +1,240 @@
+## SIMULATION 
+
+# SUMMER package 
+library(SUMMER)
+
+
+# Simulate from binomial distribution with rbinom 
+?rbinom
+
+# n = number samples 
+# size = Ntrials
+# prob = probability of succes = logistic(a + bx1 + ....)
+
+# Example 
+a=rbinom(n=1,size=10,prob=0.5)
+
+
+# Binomial probs are obtained by exp(linear predictor) / (1+exp(linear predictor))
+# - In sensitivitys_se.R; computed in compted_probs where alpha = linear predictor 
+# - and probs = logit-1(alpha) 
+
+
+
+## Sample from ICAR (spatial dependence) model
+
+# Use SUMMER package -> rst function; it simulates spatial (and temporal) random 
+# effects with mean zero
+# n = sample size
+# type = "s" = spatial random effect 
+# type.s = ICAR = only ICAR spatial random effect available
+# Amat = adjecency matrix for spatial regions
+# scale.model = scale random effects to have unit generalized variance
+
+?rst
+
+rst(n=1,type="s",Amat = map.nb)
+
+# Amat = neigboorhood matrix (adjecency matrix)
+plot(map.shp,main="Neighbors");plot(map.nb,coordinates(map.shp),add=TRUE,col="red")
+
+# Voeren has no neighbors (leave out or set zero.policy?-)
+# type = "B" = binary
+# Convert neighbour list object to matrxi with nb2mat
+nb_matrix <- nb2mat(map.nb,style="B",zero.policy = TRUE) 
+# check heatmap
+heatmap(nb_matrix,Rowv = NA, Colv=NA)
+
+# Spatial Random Effect 
+set.seed(12)
+
+simRE_IM <- rst(n=1,type="s",Amat=nb_matrix,scale.model=T)
+simRE_IM <- as.vector(simRE_IM)
+
+# Divide by esimated precision -> why? 
+simRE_IM_scaled <- simRE_IM/sqrt(96.97)
+
+# plots
+hist(simRE_IM,main="ICAR");hist(simRE_IM_scaled,add=TRUE,col="red")
+legend("topright",c("RE","RE_scaled"),col=c("grey","red"),lwd=2)
+
+# Plot
+map_RE_sim <- st_as_sf(map.shp) %>% 
+  arrange(ID) %>% 
+  mutate(simRE_IM_scaled = exp(simRE_IM_scaled))
+
+ggplot(data = map_RE_sim)+
+  theme_void()+
+  geom_sf(aes(fill=simRE_IM_scaled))+
+  scale_fill_continuous("Simulated Odds Ratio",type="viridis")
+
+
+ # How to take into account estimates??? 
+# - only with precision estimate? 
+# - Weights? 
+
+# How to specifically adjust random effect for certain regions?
+
+
+## Simulate practice random effect -> Normal distr.
+
+# rnorm
+# - n = number of samples = number of practices 
+# - mean = 0
+# - sd = estimted std dev of practice distribution 
+
+summary(inla.out_noiid_binom)
+
+# Precision for practice id = 2.81 (mean) -> stdev = 1/sqrt(2.81)
+stdev_practice <- 1/sqrt(2.81)
+
+set.seed(12)
+simRE_pract <- rnorm(n=105,mean=0,sd=stdev_practice)
+
+hist(simRE_pract,main="Simulated Practice Effect")
+hist(exp(simRE_pract),main="Simulated Practice Odds Ratio")
+
+# Plot on map 
+practice_coordinates <- readRDS("./practice_location_data.rds")
+practice_coordinates$simRE_pract<- simRE_pract
+practice_re <- practice_coordinates %>% select(practice_id,lon.pc_mean,lat.pc_mean,simRE_pract)
+
+
+ggplot(data = map_RE_sim) +
+  theme_void() +
+  geom_sf(fill = 'gray', color = 'gray', alpha = .1) +
+  geom_point(data = practice_re, 
+             aes(x = lon.pc_mean, y = lat.pc_mean,size=exp(simRE_pract),colour=exp(simRE_pract)),alpha = 1)+
+  theme(legend.position = "right") + 
+  scale_colour_continuous("Simulated Odds ratio",type="viridis") + 
+  scale_size(guide='none')
+
+
+## Intego data with simulated data from computed p from estimates
+set.seed(1)
+intego_lrti <- as_tibble(doubledata) %>% 
+  filter(!is.na(ncases)) %>% 
+  select(nis_code,ID,sex,age.category,increased_compensation,practice_id,ncases,npatients) %>% 
+  left_join(computed_probs %>% 
+              select(-alpha_binom,-alpha_pois,-prob_pois),
+            by=c("ID","sex","age.category","increased_compensation","practice_id")) %>% 
+  rowwise() %>% 
+  mutate(ncases_sim = rbinom(n=1,size=npatients,prob=prob_binom)) %>% 
+  ungroup()
+
+## With simulated REs
+RE_nis <- inla.out_noiid_binom$summary.random$ID[,c("ID","mean")] %>% 
+  mutate(sim = simRE_IM_scaled) %>% 
+  column_to_rownames(var="ID")
+RE_practice <- inla.out_noiid_binom$summary.random$practice_id[,c("ID","mean")] %>% 
+  left_join(practice_re %>% 
+              select(practice_id,simRE_pract),
+            by=c("ID"="practice_id")) %>% 
+  rename(sim=simRE_pract) %>% 
+  column_to_rownames(var="ID")
+
+# Fixed effects remain the same 
+FE <- data.frame(
+  ID = c("intercept","M","(-1,5]","(5,16]","(50,65]","(65,85]","(85,110]","Yes"),
+  mean = inla.out_noiid_binom$summary.fixed$mean
+) 
+
+# Add the reference values 
+FE <- rbind(FE,
+               data.frame(
+                 ID = c("F","(16,50]","No"),
+                 mean = c(0,0,0)
+               )) %>% 
+  column_to_rownames(var="ID")
+
+# Compute sim probs
+set.seed(12)
+intego_lrti_sim <- as_tibble(doubledata) %>% 
+  filter(!is.na(ncases)) %>% 
+  ungroup() %>% 
+  select(nis_code,ID,sex,age.category,increased_compensation,practice_id,ncases,npatients) %>% 
+  # Change to characters
+  mutate_if(is.factor,as.character) %>% 
+  # Compute linear predictor
+  mutate(sim_alpha_binom = FE["intercept",]+
+           RE_nis[ID,]$sim+
+           FE[sex,]+
+           FE[age.category,]+
+           FE[increased_compensation,]+
+           RE_practice[practice_id,]$sim,
+         sim_prob_binom = round(exp(sim_alpha_binom)/(1+exp(sim_alpha_binom)),3)) %>% 
+  rowwise() %>% 
+  mutate(sim_ncases = rbinom(n=1,size=npatients,prob=sim_prob_binom)) %>% 
+  ungroup() %>% 
+  # Make factors for analysis 
+  mutate(age.category=factor(age.category,
+                             levels=c("(16,50]","(-1,5]","(5,16]","(50,65]","(65,85]","(85,110]")))
+
+
+# Analyse with same model 
+formula_sim <- sim_ncases ~ sex + age.category + increased_compensation  + 
+  f(ID, model="besag",graph="map.gra",scale.model=T) + 
+  f(practice_id, model="iid")
+
+inla.out_sim <- inla(formula_sim,
+                             family="binomial",
+                             data = intego_lrti_sim,
+                             Ntrials = npatients, # N Bernouilli experiments
+                             control.predictor = list(link=T),
+                             control.compute=list(waic=T,dic=T,config=T)
+)
+
+# Fixed effects
+fe_binom_sim <- get_fixed_effects_inla(inla.out_sim)
+
+pl_binom_sim <- plot_fixed_effects(fe_binom_sim)
+pl_binom_sim
+
+# Random effects
+re_binom_sim <- get_random_effects_inla(inla.out_sim)
+
+pl_re_binom_sim<-plot_random_effects(re_binom_sim)
+
+pl_re_binom_sim
+
+## Compare estimes 
+
+# practice 
+sim_re_practice <- inla.out_sim$summary.random$practice_id %>% 
+  select(ID,mean)
+compare_re_practice <- RE_practice %>% 
+  rownames_to_column(var="ID") %>% 
+  left_join(sim_re_practice,by="ID")
+
+ggplot(compare_re_practice,aes(x=sim,y=mean.y))+
+  geom_point()+
+  geom_smooth(method="lm",formula=y~x)+
+  geom_abline()+
+  labs(x="Effects TO Simulate",y="Effects FROM Simulated")
+
+ggplot()+
+  geom_density(data=as_tibble(simRE_pract),aes(x=exp(value),fill="to simulate"),col="grey",alpha=0.6)+
+  geom_density(data=sim_re_practice,aes(x=exp(mean),fill="from simulated"),col="grey",alpha=0.6)+
+  labs(x="Estimate",fill="RE practice")
+
+
+
+# Satial 
+sim_re_nis <- inla.out_sim$summary.random$ID %>% 
+  select(ID,mean)
+compare_re_nis <- RE_nis %>% 
+  rowid_to_column(var="ID") %>% 
+  left_join(sim_re_nis,by="ID")
+
+ggplot(compare_re_nis,aes(x=sim,y=mean.y))+
+  geom_point()+
+  geom_smooth(method="lm",formula=y~x)+
+  geom_abline()+
+  labs(x="Effects TO Simulate",y="Effects FROM Simulated")
+
+hist(simRE_IM_scaled,main="Distribution RE spatial",xlab="Estimate");hist(sim_re_nis$mean,add=TRUE,col="red")
+legend("topright",c("To simulate","From simulated"),col=c("grey","red"),lwd=2)
+
+ggplot()+
+  geom_den(data=as_tibble(simRE_IM_scaled),aes(x=value,fill="to simulate"),bins=106,col="grey",alpha=0.6)+
+  geom_histogram(data=sim_re_nis,aes(x=mean,fill="from simulated"),col="grey",bins=106,alpha=0.6)

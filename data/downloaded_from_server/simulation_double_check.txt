@@ -1,0 +1,142 @@
+
+# Doubble check estimates from simulation (20/07)
+
+
+# Load data using simulation.fixed.R
+
+
+################################################################################
+
+# Model with practice and icar 
+
+# Model 
+formula <- ncases ~ sex + age.category + increased_compensation  + 
+  f(ID, model="besag",graph="map.gra",scale.model=T) + # ICAR
+  f(practice_id, model="iid")
+
+# Binomial  
+inla.out <- inla(formula,
+                   family="binomial",
+                   data = inla.data,
+                   Ntrials = npatients # N Bernouilli experiments
+                   # control.predictor = list(link=T),
+                   # control.compute=list(waic=T,dic=T,config=T)
+)
+
+# Fixed effects 
+fe_out <- get_fixed_effects_inla(inla.out)
+plot_fixed_effects(fe_out)
+
+# Random effects 
+re_out <- get_random_effects_inla(inla.out)
+plot_random_effects(re_out)
+plot(exp(inla.out$summary.random$ID$mean)) # Same as plot_random_effects
+
+# Get estimates to simulate 
+model_oi <- inla.out
+point_estimates <- rbind(
+    model_oi$summary.fixed %>% rownames_to_column(var="parameter") %>%
+      # Rename to be consistent with inla.data
+      mutate(parameter = c("intercept","M","(-1,5]","(5,16]","(50,65]","(65,85]","(85,110]","Yes")) %>%
+      # Add reference ceategories
+      add_row(parameter = c("F","(16,50]","No"),
+              mean = c(0,0,0)),
+    model_oi$summary.random$ID %>% rename(parameter=ID),
+    model_oi$summary.random$practice %>% rename(parameter=ID)
+   ) 
+
+# prepare to use 
+estimates <- point_estimates %>% 
+  column_to_rownames(var="parameter")
+
+# Simulate cases 
+inla.data.sim <- inla.data %>% 
+  # select(nis_code,ID,sex,age.category,increased_compensation,practice_id,ncases,npatients) %>% 
+  # Change to characters
+  mutate_if(is.factor,as.character) %>% 
+  mutate(ID=as.character(ID)) %>% 
+  # Compute linear predictor
+  mutate(lp = estimates["intercept",]$mean+
+           estimates[ID,]$mean+
+           estimates[sex,]$mean+
+           estimates[age.category,]$mean+
+           estimates[increased_compensation,]$mean+
+           estimates[practice_id,]$mean,
+         p = exp(lp)/(1+exp(lp))) %>%  
+  # Make factors again for analysis 
+  mutate(age.category=factor(age.category,
+                             levels=c("(16,50]","(-1,5]","(5,16]","(50,65]",
+                                      "(65,85]","(85,110]")),
+         increased_compensation = factor(increased_compensation,
+                                         levels=c("No","Yes")),
+         sex = factor(sex,levels=c("F","M")),
+         ID = as.integer(ID))
+
+# inla .sim = inla.data 
+identical(inla.data.sim %>% 
+            select(-lp,-p),
+          inla.data)
+
+# Add column of simulated ncases  --> Error for Herstappe == NA (problem??)
+set.seed(1)
+inla.data.sim <- inla.data.sim %>% 
+  # drop_na() %>% 
+  rowwise() %>% 
+  mutate(ncases_sim = rbinom(n=1,size=npatients,prob=p)) %>% 
+  ungroup()
+
+# Analyse simulated data 
+# Model 
+formula <- ncases_sim ~ sex + age.category + increased_compensation  + 
+  f(ID, model="besag",graph="map.gra",scale.model=T) + # ICAR
+  f(practice_id, model="iid")
+
+# Binomial  
+inla.sim <- inla(formula,
+                 family="binomial",
+                 data = inla.data.sim,
+                 Ntrials = npatients # N Bernouilli experiments
+                 # control.predictor = list(link=T),
+                 # control.compute=list(waic=T,dic=T,config=T)
+)
+
+# Fixed effect 
+fe_sim <- get_fixed_effects_inla(inla.sim)
+plot_fixed_effects(fe_sim)
+
+# Random effect 
+re_sim <- get_random_effects_inla(inla.sim)
+plot_random_effects(re_sim)
+plot(exp(inla.sim$summary.random$ID$mean)) # Same as plot_random_effects
+
+#
+# This gives same West-East effect !! 
+#
+
+# Simulate as done in simulation_fixed.R
+probs <- inla.data.sim$p  
+npats <- inla.data.sim$npatients
+
+sim_ncases <- c()
+for(i in 1:length(probs)){
+  set.seed(1)
+  sim_ncases[i] <- rbinom(n=1,size=npats[i],prob=probs[i])
+  
+}
+plot(sim_ncases,inla.data.sim$ncases_sim)
+
+# --> Not identical, while set.seed(1) is same --> ?? 
+
+# set.seed(1) outside inner loop:
+set.seed(1)
+sim_ncases <- c()
+for(i in 1:length(probs)){
+  sim_ncases[i] <- rbinom(n=1,size=npats[i],prob=probs[i])
+}
+plot(sim_ncases,inla.data.sim$ncases_sim)
+
+# --> Identical -> this is the way to do it?? YES
+
+
+
+

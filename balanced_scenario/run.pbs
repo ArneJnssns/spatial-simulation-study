@@ -1,0 +1,12 @@
+#!/bin/bash -l
+
+#PBS -l nodes=1:ppn=27:skylake
+#PBS -l walltime=10:00:00
+
+module purge
+module use /apps/leuven/skylake/2021a/modules/all
+module load R/4.1.0-foss-2021a
+
+cd $PBS_O_WORKDIR
+
+Rscript --vanilla simulation_hpc_wf.R $sd_practice $n_practices $sd_spatial

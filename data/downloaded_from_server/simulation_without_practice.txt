@@ -1,0 +1,315 @@
+
+## Without practice effect
+
+inla.sim <- inla.data %>% 
+  select(nis_code,ID,sex,age.category,increased_compensation,practice_id,ncases,npatients) %>% 
+  # Change to characters
+  mutate_if(is.factor,as.character) %>% 
+  mutate(ID=as.character(ID)) %>% 
+  # Compute linear predictor
+  mutate(sim_alpha_binom = estimates["intercept",]$mean+
+           estimates[ID,]$mean+
+           estimates[sex,]$mean+
+           estimates[age.category,]$mean+
+           estimates[increased_compensation,]$mean,
+         # estimates[practice_id,]$mean,
+         sim_prob_binom = exp(sim_alpha_binom)/(1+exp(sim_alpha_binom))) %>% 
+  # Make factors for analysis 
+  mutate(age.category=factor(age.category,
+                             levels=c("(16,50]","(-1,5]","(5,16]","(50,65]","(65,85]","(85,110]")))
+
+probs <- inla.sim$sim_prob_binom  
+npats <- inla.sim$npatients
+
+nsim=100
+sim_ncases <- matrix(nrow=length(probs),ncol=nsim)
+for(j in 1:nsim){
+  set.seed(j) # Should be here (check simulation_double_check.R)
+  for(i in 1:length(probs)){
+    sim_ncases[i,j] <- rbinom(n=1,size=npats[i],prob=probs[i])
+  }
+}
+
+plot(sim_ncases[,1],sim_ncases[,100])
+hist(sim_ncases)
+
+
+nsim<-100
+
+# Estimates
+fe <- array(dim=c(8,nsim,4),dimnames = list(NULL,NULL,c("mean","sd","lower","upper")))
+re_nis <- array(dim=c(300,nsim,4),dimnames = list(NULL,NULL,c("mean","sd","lower","upper")))
+re_practice <- array(dim=c(105,nsim,4),dimnames = list(NULL,NULL,c("mean","sd","lower","upper")))
+
+# Odds scale
+fe_odds <- array(dim=c(8,nsim,4),dimnames = list(NULL,NULL,c("mean","sd","lower","upper")))
+re_nis_odds <- array(dim=c(300,nsim,4),dimnames = list(NULL,NULL,c("mean","sd","lower","upper")))
+re_practice_odds <- array(dim=c(105,nsim,4),dimnames = list(NULL,NULL,c("mean","sd","lower","upper")))
+
+
+# Formula
+formula <- ncases ~ sex + age.category + increased_compensation  +
+  f(ID, model="besag",graph="map.gra",scale.model=T)  # ICAR
+# f(practice_id, model="iid")
+
+
+# Simulation
+start <- Sys.time()
+for(n in 1:nsim){
+  
+  cat(paste0("Simulation ",n," / ",nsim,"\n"))
+  
+  data.sim <- inla.data %>% mutate(ncases=sim_ncases[,n])
+  
+  inla.out <- inla(formula,
+                   family="binomial",
+                   data = data.sim,
+                   Ntrials = npatients # N Bernouilli experiments
+                   # control.predictor = list(link=T),
+                   # control.compute=list(waic=T,dic=T,config=T)
+  )
+  
+  
+  
+  fe_out <- get_fixed_effects_inla(inla.out,OR=FALSE)
+  re_out <- get_random_effects_inla(inla.out,OR=FALSE)
+  
+  fe_out_odds <- get_fixed_effects_inla(inla.out,OR=TRUE)
+  re_out_odds <- get_random_effects_inla(inla.out,OR=TRUE)
+  
+  fe[,n,"mean"] <- as.matrix(fe_out[,2])
+  fe[,n,"sd"] <- as.matrix(fe_out[,3])
+  fe[,n,"lower"] <- as.matrix(fe_out[,4])
+  fe[,n,"upper"] <- as.matrix(fe_out[,5])
+  
+  re_nis[,n,"mean"] <- as.matrix(re_out$ID[,2])
+  re_nis[,n,"sd"] <- as.matrix(re_out$ID[,3])
+  re_nis[,n,"lower"] <- as.matrix(re_out$ID[,4])
+  re_nis[,n,"upper"] <- as.matrix(re_out$ID[,5])
+  
+  # re_practice[,n,"mean"] <- as.matrix(re_out$practice[,2])
+  # re_practice[,n,"sd"] <- as.matrix(re_out$practice[,3])
+  # re_practice[,n,"lower"] <- as.matrix(re_out$practice[,4])
+  # re_practice[,n,"upper"] <- as.matrix(re_out$practice[,5])
+  
+  fe_odds[,n,"mean"] <- as.matrix(fe_out_odds[,2])
+  fe_odds[,n,"sd"] <- as.matrix(fe_out_odds[,3])
+  fe_odds[,n,"lower"] <- as.matrix(fe_out_odds[,4])
+  fe_odds[,n,"upper"] <- as.matrix(fe_out_odds[,5])
+  
+  re_nis_odds[,n,"mean"] <- as.matrix(re_out_odds$ID[,2])
+  re_nis_odds[,n,"sd"] <- as.matrix(re_out_odds$ID[,3])
+  re_nis_odds[,n,"lower"] <- as.matrix(re_out_odds$ID[,4])
+  re_nis_odds[,n,"upper"] <- as.matrix(re_out_odds$ID[,5])
+  
+  # re_practice_odds[,n,"mean"] <- as.matrix(re_out_odds$practice[,2])
+  # re_practice_odds[,n,"sd"] <- as.matrix(re_out_odds$practice[,3])
+  # re_practice_odds[,n,"lower"] <- as.matrix(re_out_odds$practice[,4])
+  # re_practice_odds[,n,"upper"] <- as.matrix(re_out_odds$practice[,5])
+  
+  
+}
+end <- Sys.time()
+end-start
+
+
+# ICAR IN & ICAR + PRACTICE OUT -> 1.7h
+# simulation_in_icar_out_icar_practice <- list(fe=fe,nis=re_nis,practice=re_practice,
+#                                              fe_odds=fe_odds,nis_odds=re_nis_odds,practice_odds=re_practice_odds)
+# saveRDS(simulation_in_icar_out_icar_practice,"./Code/simulation_in_icar_out_icar_practice.rds")
+
+# ICAR IN & ICAR OUT -> 54''
+# simulation_in_icar_out_icar <- list(fe=fe,nis=re_nis,
+#                                              fe_odds=fe_odds,nis_odds=re_nis_odds)
+# saveRDS(simulation_in_icar_out_icar,"./Code/simulation_in_icar_out_icar.rds")
+
+
+
+
+########################## Simulation results #################################
+
+
+### Input see simulation_fixed.R
+
+
+### ICAR IN ICAR OUT 
+
+sim_icar <- readRDS("./Code/simulation_in_icar_out_icar.rds")
+
+hist(cor(icar$mean,sim_icar$nis[,,"mean"]),main="Pearson correlation of input and 100 simulations",
+     xlab="Pearson")
+hist(cor(exp(icar$mean),sim_icar$nis_odds[,,"mean"]),main="Pearson correlation of input and 100 simulations",
+     xlab="Pearson")
+hist(cor(icar$sd,sim_icar$nis[,,"sd"],method="spearman"),main="Pearson correlation of input and 100 simulations",
+     xlab="Pearson")
+
+
+
+#### FIXED EFFECTS 
+
+n_sim <- 100 # Number of simulated datasets
+n_fixed <- 8 # Number of fixed effects 
+est_measures <- c("mean","sd","lower","upper") # Measures gathered from analysis
+
+est_measures_values <- sim_icar$fe # the measures' values we want to collect 
+
+# Input effects
+input_estimates <- readRDS("./Code/binom_point_estimates.rds") %>% 
+  column_to_rownames(var="parameter")
+
+
+# Function to make vector of measures matrix 
+make_longer <- function(array_oi,matrix="mean"){
+  return(as.vector(t(array_oi[,,matrix])))
+}
+
+
+# Function to gather all data
+gather_input_output_measures <- function(est_measures=c("mean","sd","lower","upper"),
+                                         input_meas,output_meas,
+                                         n_sim=100,n_fixed=8,n_re_nis=300,
+                                         n_re_practice=105,effect="fixed"){
+  
+  
+  # Collect input effect+ output 
+  
+  if(effect=="fixed"){
+    
+    # Gather all measures for each parameter
+    fe_sim <- matrix(nrow=n_fixed*n_sim,ncol=length(est_measures),dimnames=list(NULL,est_measures))
+    for(m in est_measures){
+      fe_sim[,m]<-make_longer(output_meas,m)  
+    }
+    
+    input_meas_oi <- input_meas %>% slice(1:n_fixed)
+    names_est <- rownames(input_meas_oi)
+    fe_sim <- cbind.data.frame(fe_sim,"index"=rep(1:n_sim,n_fixed),"parameter"=rep(names_est,each=n_sim))
+    
+    # Put all data together
+    fe_var <- as_tibble(fe_sim) %>% 
+      left_join(input_meas %>% 
+                  slice(1:n_fixed) %>% 
+                  select(mean,sd) %>% 
+                  rownames_to_column(var="parameter"),
+                by="parameter",
+                suffix=c(".out",".in")) %>% 
+      mutate(in_ci = ifelse(mean.in <= upper & mean.in >= lower,"1","0"))
+    
+  }else if(effect=="icar"){
+    
+    # Gather all measures for each parameter
+    fe_sim <- matrix(nrow=n_re_nis*n_sim,ncol=length(est_measures),dimnames=list(NULL,est_measures))
+    for(m in est_measures){
+      fe_sim[,m]<-make_longer(output_meas,m)  
+    }
+    
+    # Add Names of Parameters
+    input_meas_oi <- input_meas %>% slice((n_fixed+4):(n_fixed+4+n_re_nis-1))
+    names_est <- rownames(input_meas_oi)
+    fe_sim <- cbind.data.frame(fe_sim,"index"=rep(1:n_sim,n_re_nis),"parameter"=rep(names_est,each=n_sim))
+    
+    # Put all data together
+    fe_var <- as_tibble(fe_sim) %>% 
+      left_join(input_meas_oi %>%  
+                  select(mean,sd) %>% 
+                  rownames_to_column(var="parameter"),
+                by="parameter",
+                suffix=c(".out",".in")) %>% 
+      mutate(in_ci = ifelse(mean.in <= upper & mean.in >= lower,"1","0"))
+    
+  }else{
+    
+    # Gather all measures for each parameter
+    fe_sim <- matrix(nrow=n_re_practice*n_sim,ncol=length(est_measures),dimnames=list(NULL,est_measures))
+    for(m in est_measures){
+      fe_sim[,m]<-make_longer(output_meas,m)  
+    }
+    
+    # Add Names of Parameters
+    input_meas_oi <- input_meas %>% slice((n_fixed+4+n_re_nis):(n_fixed+4+n_re_nis+n_re_practice-1))
+    names_est <- rownames(input_meas_oi)
+    fe_sim <- cbind.data.frame(fe_sim,"index"=rep(1:n_sim,n_re_practice),"parameter"=rep(names_est,each=n_sim))
+    
+    # Put all data together
+    fe_var <- as_tibble(fe_sim) %>% 
+      left_join(input_meas_oi %>%  
+                  select(mean,sd) %>% 
+                  rownames_to_column(var="parameter"),
+                by="parameter",
+                suffix=c(".out",".in")) %>% 
+      mutate(in_ci = ifelse(mean.in <= upper & mean.in >= lower,"1","0"))
+    
+  }
+  
+  
+}
+
+
+
+
+
+
+fe_var <- gather_input_output_measures(input_meas = input_estimates,
+                                            output_meas = sim_icar$fe,
+                                            effect="fixed",
+                                            n_fixed = 8,
+                                            n_sim=100)
+
+re_var_nis_test <- gather_input_output_measures(input_meas = input_estimates,
+                                                output_meas = sim_icar$nis,
+                                                effect="icar")
+
+
+
+# Odds ratios boxplot
+ggplot(data=fe_var,aes(x=index,y=mean.out,group=parameter))+
+  geom_boxplot(alpha=0.8)+
+  geom_point(aes(color=in_ci))+
+  geom_line(aes(x=index,y=mean.in),color="red",size=1.2)+
+  geom_hline(yintercept = 0)+
+  # geom_errorbar(aes(ymin=lower,ymax=upper))+
+  facet_grid(cols=vars(parameter),scales="free")+
+  theme(axis.text.x = element_blank())+
+  labs(x="Simulation",y="Estimate")+
+  scale_color_manual(values=c("1"="black","0"="red"))
+
+# Odds ratios CIs 
+ggplot(data=fe_var,aes(x=index,y=mean.out,group=parameter))+
+  theme_bw()+
+  geom_point(aes(color=in_ci))+
+  geom_errorbar(aes(ymin=lower,ymax=upper),color="grey20")+
+  geom_line(aes(x=index,y=mean.in),color="black",size=1,alpha=0.6)+
+  facet_grid(vars(parameter),scales="free")+
+  # theme(axis.text.x = element_blank())+
+  labs(x="Simulation",y="Estimate")+
+  scale_color_manual(values=c("1"="grey20","0"="red"))
+
+ggplot(data=fe_var,aes(x=index,y=sd,group=parameter))+
+  theme_bw()+
+  geom_point()+
+  facet_grid(vars(parameter),scales="free")+
+  # theme(axis.text.x = element_blank())+
+  labs(x="Simulation",y="Estimate")
+
+
+
+
+
+# ICAR IN ICAR+PRACTICE OUT 
+sim_icar_practice <- readRDS("./Code/simulation_in_icar_out_icar_practice.rds")
+
+# Quick plots 
+hist(icar$mean)
+hist(sim_icar$nis[,,"mean"])
+
+
+icar_used <- icar$mean
+icar_obtained <- sim_icar$nis[,,"mean"]
+plot(1:100,cor(icar$mean,sim_icar$nis[,,"mean"]))
+cor(icar_used,icar_obtained[,100])
+
+plot(icar$mean,rowMeans(sim_icar$nis[,,"mean"]))+abline(a=0,b=1)
+
+hist(sim_icar_practice$practice[,,"mean"])
+
+

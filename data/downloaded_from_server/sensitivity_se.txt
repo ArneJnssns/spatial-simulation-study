@@ -1,0 +1,1196 @@
+S ################################################################################
+## SENSITIVY ANALYSIS (INLUDING PREDICTIONS)
+##
+## Model with Socio-Economic (SE) variable 
+################################################################################
+
+
+###########
+# Best model (ID+IID+PRACTICE_ID)
+# 2nd Best model (ID+PRACTICE) --> continue with this
+# 
+# Random Subsets of Practices sensitivity 
+# - nothing found in analysis of this --> stat simulation 
+
+rm(list=ls())
+
+# Libraries
+library(tidyverse)
+library(lubridate)
+
+library(INLA)
+library(rgdal)
+library(spdep)
+
+library(RColorBrewer)
+library(classInt)
+
+# Setwd
+setwd("Z:/Projects_Arne/Simulation_Spatial")
+
+# Avoid scientific notation
+options(scipen=999)
+
+# Functions 
+source("./Code/functions_geo.R")
+source("./Code/functions_inla.R")
+
+
+# READ DATA 
+################################################################################
+
+## LRTI DATA 2019
+lrti_data <- readRDS("./Data/lrti_data_2019.rds")
+
+# Look at structure of data
+str(lrti_data)
+
+## MAP as polygon object (rgdal) (mabe also possible with sf object?)
+map.shp <- readOGR("Z:/Intego_Data/Spatial_Data/Shape_Files/Flanders_2019/Refgem.shx")
+
+# Plot 
+plot(map.shp)
+
+
+#### PREPARE DATA 
+################################################################################
+
+## PREPARE MAP DATA
+map.shp <- map.shp[order(map.shp@data$NISCODE),] 
+
+# RANDOM EFFECTS for each area
+map.shp@data$ID <- 1:nrow(map.shp@data)
+map.shp@data$ID2 <- map.shp@data$ID
+
+## ID MAPPING 
+nis_id <- map.shp@data %>% select(nis_code = NISCODE,name=NAAM,ID)
+
+# Create adjecency matrix based on the shape file 
+# set rows names of neighbor list to the ID variable
+map.nb <- poly2nb(map.shp,row.names=map.shp@data$ID,queen=T)
+
+## Convert the adjency matrix into a file in the INLA format
+# Save the neighbor list to an external file, INLA needs the list this way
+nb2INLA(map.nb,file="map.gra")
+
+## Structure data for model use using predefined function specific for this binom model
+
+# inputs
+outcome <- c("event")
+covariate_fixed <- c("sex","age.category","increased_compensation")
+covariate_random <- c("practice_id","nis_code")
+post_to_nis <- get_post_to_nis_mapping()
+age_breaks <- c(-1,5,16,50,65,85,110) 
+remove_nis<- c()
+
+# Structured data
+doubledata <- get_structured_data_binom(lrti_data,outcome,covariate_fixed,covariate_random,
+                                        post_to_nis,age_breaks,remove_nis,map.shp)
+
+
+
+################################################################################
+## Best model = model wih icar, iid, practice
+
+
+# Best model 
+formula_best<- ncases ~ sex + age.category + increased_compensation  + 
+  f(ID, model="besag",graph="map.gra",scale.model=T) + 
+  f(practice_id, model="iid") + 
+  f(ID2,model="iid")
+
+
+# Test 
+inla.out_best <- inla(formula_best,
+                      family="binomial",
+                      data = doubledata,
+                      Ntrials = npatients, # N Bernouilli experiments 
+                      control.predictor = list(link=T),
+                      control.compute=list(waic=T,dic=T,config=T)
+)
+
+
+# estimates
+fe_best <- get_fixed_effects_inla(inla.out_best)
+re_best <- get_random_effects_inla(inla.out_best)
+
+# predictions
+predictions_best <- get_predicted_incidence_inla(inla.out_best,doubledata)
+
+# Plots
+plot_fixed_effects(fe_best)
+plot_random_effects(re_best,n_re = 3)
+
+plot_predicted_incidence(predictions_best)
+
+
+### WITHOUT PRACTICE --> COMPARE PREDICTIONS 
+
+# Best model 
+formula<- nlrti ~ sex + age.category + increased_compensation  + 
+  f(ID, model="besag",graph="map.gra",scale.model=T) + 
+  f(ID2,model="iid")
+
+
+# Test 
+inla.out <- inla(formula,
+                 family="binomial",
+                 data = doubledata,
+                 Ntrials = npatients, # N Bernouilli experiments 
+                 control.predictor = list(link=T),
+                 control.compute=list(waic=T,dic=T,config=T)
+)
+
+
+# estimates
+fe <- get_fixed_effects_inla(inla.out)
+re <- get_random_effects_inla(inla.out)
+
+# predictions
+predictions <- get_predicted_incidence_inla(inla.out,doubledata)
+
+# Plots
+plot_fixed_effects(fe)
+plot_random_effects(re,n_re = 3)
+
+plot_predicted_incidence(predictions)
+
+
+diff <- predictions 
+diff$pred <- predictions_best$pred - predictions$pred
+
+summary(diff$pred)
+
+plot_predicted_incidence(diff)
+
+map.sf <- st_as_sf(map.shp)
+str(map.sf)
+map.sf<-map.sf %>% left_join(diff,by=c("NISCODE"="nis_code"))
+ggplot(map.sf)+
+  geom_sf(aes(fill=(pred<0)),alpha=0.6)+
+  theme_void()+
+  scale_fill_discrete("Higher predictions",labels=c("Yes","No"))
+
+data_preds <- rbind(predictions %>% mutate(type="no_prct"),
+                    predictions_best %>% mutate(type="prct")) %>% 
+  filter(!is.na(pred))
+ggplot(data_preds,aes(x=nis_code,y=pred,colour=(type)))+
+  geom_point()
+
+x = predictions %>% left_join(predictions_best,by="nis_code",suffix=c(".no_prct",".prct")) %>% 
+  drop_na()
+ggplot(x,aes(x=pred.no_prct,y=pred.prct))+
+  geom_point()+
+  geom_abline(intercept = 0)+
+  geom_smooth(method="lm",formula = y~x)+
+  labs(x="Without Practice",y="With Practice",title="Predicted incidence (/ 100,000)")+
+  theme_bw()
+
+
+######## PER PRACTICE ########
+
+hist(re_best$practice_id$Mean)
+practices_high <- re_best$practice_id$ID[re_best$practice_id$Mean>=3]
+
+ggplot(re_best$practice_id,aes(x=Mean,y=""))+
+  geom_boxplot()+
+  geom_jitter(aes(col=Mean>=3))+
+  theme_bw()+
+  coord_flip()+
+  labs(x="Mean PRactice Effect",y="")
+
+# Data for these practices 
+data_high <- lrti_data.inla %>% group_by(practice_id) %>% 
+  summarize(nlrti=sum(nlrti),
+            npatients = sum(npatients)) %>% 
+  mutate(type=ifelse(practice_id%in%practices_high,"high","ok"),
+         inc = nlrti/npatients)
+
+data_high_plot <- pivot_longer(data_high,cols=c("nlrti","npatients","inc"))
+
+ggplot(data_high,aes(x=inc,y=" "))+
+  geom_boxplot()+
+  geom_jitter(aes(colour=type),alpha=0.8,size=2)+
+  coord_flip()+
+  theme_bw()+
+  scale_color_manual("'Peak Practices'",values=c("red","black"),labels=c("Yes","No"))+
+  labs(x="Incidence",y="")+
+  theme(legend.position="none")
+
+
+
+
+################################################################################
+## Model without nis iid 
+################################################################################
+
+## Comparison of :
+# family = "binomial"
+# family = "poisson" 
+# -> Change in fixed effects when doing this 
+
+
+formula_noiid<- ncases ~ sex + age.category + increased_compensation  + 
+  f(ID, model="besag",graph="map.gra",scale.model=T) + 
+  f(practice_id, model="iid")
+
+
+# Biomial  
+inla.out_noiid_binom <- inla(formula_noiid,
+                             family="binomial",
+                             data = doubledata,
+                             Ntrials = npatients, # N Bernouilli experiments
+                             control.predictor = list(link=T),
+                             control.compute=list(waic=T,dic=T,config=T)
+)
+
+# Poisson 
+inla.out_noiid_pois <- inla(formula_noiid,
+                            family="poisson",
+                            data = doubledata,
+                            # Ntrials = npatients, # N Bernouilli experiments
+                            # control.family = list(link="log"),
+                            offset = log(npatients),
+                            control.predictor = list(link=T),
+                            control.compute=list(waic=T,dic=T,config=T)
+)
+
+#---------------------- Plots -------------------------------------------------#
+
+# Fixed effects
+fe_noiid_binom <- get_fixed_effects_inla(inla.out_noiid_binom)
+fe_noiid_pois <- get_fixed_effects_inla(inla.out_noiid_pois)
+
+pl_binom <- plot_fixed_effects(fe_noiid_binom)
+pl_pois <- plot_fixed_effects(fe_noiid_pois)
+library(cowplot)
+plot_grid(pl_binom,pl_pois,ncol=1)
+
+# Random effects
+re_noiid_binom <- get_random_effects_inla(inla.out_noiid_binom)
+re_noiid_pois <- get_random_effects_inla(inla.out_noiid_pois)
+
+pl_re_binom<-plot_random_effects(re_noiid_binom)
+pl_re_poiss<-plot_random_effects(re_noiid_pois)
+
+pl_re_binom
+pl_re_poiss
+
+# predictions
+predictions_noiid_binom <- get_predicted_incidence_inla(inla.out_noiid_binom,doubledata)
+predictions_noiid_pois <- get_predicted_incidence_inla(inla.out_noiid_pois,doubledata)
+
+plot_predicted_incidence(predictions_noiid_binom)
+plot_predicted_incidence(predictions_noiid_pois)
+
+
+#------------------------Verhouding probabilities------------------------------#
+
+# Many combinations of variables do not occur in data -> compute p ourselves 
+# p = logistic(alpha) for binom
+# "p" = exp(alpha) for poisson 
+
+## EXAMPLE OF FITTED VALUE VERSUS COMPUTED 
+
+# BINOM
+
+linear_predictor_binom_1 <- inla.out_noiid_binom$summary.linear.predictor$mean[1]
+fitted_value_binom_1 <- inla.out_noiid_binom$summary.fitted.values$mean[1]
+
+# This is apprx. equal to fitte value as expected
+boot::inv.logit(linear_predictor_binom_1)
+
+# Compute linear predictor ourselves from estimated coefiicients
+alpha <- inla.out_noiid_binom$summary.fixed["(Intercept)",]$mean +
+  # inla.out_noiid_binom$summary.fixed["age.category(-1,5]",]$mean+
+  # inla.out_noiid_binom$summary.fixed["sexM",]$mean+
+  # inla.out_noiid_binom$summary.fixed["increased_compensationYes",]$mean+
+  inla.out_noiid_binom$summary.random$practice_id[
+    inla.out_noiid_binom$summary.random$practice_id$ID=="12335ea7-2ccd-4729-9c05-1dbb4f9e07bc",]$mean +
+  inla.out_noiid_binom$summary.random$ID[
+    inla.out_noiid_binom$summary.random$ID$ID==1,]$mean
+
+# alpah ??? linear_predictor_binom_1
+
+p <- exp(alpha)/(1+exp(alpha)) # boot::inv.logit(alpha) 
+
+# -> Slight difference between fitted value and computed one for binomial model
+
+
+# POISSON
+linear_predictor_pois_1 <- inla.out_noiid_pois$summary.linear.predictor$mean[1]
+fitted_value_pois_1 <- inla.out_noiid_pois$summary.fitted.values$mean[1]
+
+# This is apprx. equal to fitte value as expected
+exp(linear_predictor_pois_1)
+
+# Compute linear predictor ourselves from estimated coefiicients
+alpha_pois <- inla.out_noiid_pois$summary.fixed["(Intercept)",]$mean +
+  # inla.out_noiid_pois$summary.fixed["age.category(-1,5]",]$mean+
+  # inla.out_noiid_pois$summary.fixed["sexM",]$mean+
+  # inla.out_noiid_pois$summary.fixed["increased_compensationYes",]$mean+
+  inla.out_noiid_pois$summary.random$practice_id[
+    inla.out_noiid_pois$summary.random$practice_id$ID=="12335ea7-2ccd-4729-9c05-1dbb4f9e07bc",]$mean +
+  inla.out_noiid_pois$summary.random$ID[
+    inla.out_noiid_pois$summary.random$ID$ID==1,]$mean
+
+# alpah ??? linear_predictor_pois_1
+
+p_pois <- exp(alpha_pois)# boot::inv.logit(alpha) 
+
+# -> Stronger difference between fitted value and computed one for Poisson model
+
+
+## VERHOUDING KANSEN OBV FITTED VALUES
+doubledata$probs_binom<-inla.out_noiid_binom$summary.fitted.values$mean
+doubledata$probs_pois<-inla.out_noiid_pois$summary.fitted.values$mean
+
+fitted_prob <- doubledata %>% 
+  filter(sex=="M",increased_compensation=="No",ID==2,!is.na(ncases)) %>% 
+  select(age.category,practice_id,probs_binom,probs_pois)
+
+binom_matrix <- fitted_prob %>% 
+  select(-probs_pois) %>% 
+  pivot_wider(names_from = age.category, values_from = probs_binom) %>% 
+  select(-practice_id) %>% 
+  as.matrix
+
+binom_rel_prob <- binom_matrix / rowSums(binom_matrix,na.rm=T)
+
+plot(binom_rel_prob[,2]) 
+
+pois_matrix <- fitted_prob %>% 
+  select(-probs_binom) %>% 
+  pivot_wider(names_from = age.category, values_from = probs_pois) %>% 
+  select(-practice_id) %>% 
+  as.matrix
+
+pois_rel_prob <- pois_matrix / rowSums(pois_matrix,na.rm=T)
+
+plot(pois_rel_prob[,2]) 
+
+
+## VERHOUDING OBV COMPUTED VALUES
+
+## ALL COMBINATIONS
+strata <- tidyr::crossing(ID=unique(doubledata$ID),
+                          sex = unique(as.character(doubledata$sex)),
+                          age.category=unique(as.character(doubledata$age.category)),
+                          increased_compensation = unique(as.character(doubledata$increased_compensation)),
+                          practice_id = unique(doubledata$practice_id)) %>% 
+  drop_na()
+
+## Parameter estimates binom model
+ID <- inla.out_noiid_binom$summary.random$ID[,c("ID","mean")]
+practice <- inla.out_noiid_binom$summary.random$practice_id[,c("ID","mean")]
+fixed <- data.frame(
+  ID = c("intercept","M","(-1,5]","(5,16]","(50,65]","(65,85]","(85,110]","Yes"),
+  mean = inla.out_noiid_binom$summary.fixed$mean
+)
+
+# Add the reference values 
+fixed <- rbind(fixed,
+               data.frame(
+                 ID = c("F","(16,50]","No"),
+                 mean = c(0,0,0)
+               ))
+parameter_estimates_binom <- rbind(ID,practice,fixed)
+
+# Poisson
+ID <- inla.out_noiid_pois$summary.random$ID[,c("ID","mean")]
+practice <- inla.out_noiid_pois$summary.random$practice_id[,c("ID","mean")]
+fixed <- data.frame(
+  ID = c("intercept","M","(-1,5]","(5,16]","(50,65]","(65,85]","(85,110]","Yes"),
+  mean = inla.out_noiid_pois$summary.fixed$mean
+)
+
+# Add the reference values 
+fixed <- rbind(fixed,
+               data.frame(
+                 ID = c("F","(16,50]","No"),
+                 mean = c(0,0,0)
+               ))
+parameter_estimates_pois<- rbind(ID,practice,fixed)
+
+
+# Rbind all estimates 
+parameter_estimates <- rbind(parameter_estimates_binom %>% mutate(type="binom"),
+                             parameter_estimates_pois %>% mutate(type="pois")) %>%
+  pivot_wider(names_from = type,values_from = mean) %>% 
+  column_to_rownames(var="ID")
+
+# 
+computed_probs <- strata %>% 
+  mutate(alpha_binom = parameter_estimates["intercept",]$binom+
+           parameter_estimates[ID,]$binom+
+           parameter_estimates[sex,]$binom+
+           parameter_estimates[age.category,]$binom+
+           parameter_estimates[increased_compensation,]$binom+
+           parameter_estimates[practice_id,]$binom,
+         prob_binom = exp(alpha_binom)/(1+exp(alpha_binom)),
+         alpha_pois = parameter_estimates["intercept",]$pois+
+           parameter_estimates[ID,]$pois+
+           parameter_estimates[sex,]$pois+
+           parameter_estimates[age.category,]$pois+
+           parameter_estimates[increased_compensation,]$pois+
+           parameter_estimates[practice_id,]$pois,
+         prob_pois = exp(alpha_pois)) 
+
+# Nis with max random efect 
+maxnis <- which.max(inla.out_noiid_binom$summary.random$ID$mean)
+minnis <- which.min(inla.out_noiid_binom$summary.random$ID$mean)
+
+fitted_prob <- computed_probs %>% 
+  filter(sex=="M",increased_compensation=="No",ID==maxnis) %>% 
+  select(age.category,practice_id,prob_binom,prob_pois)
+
+binom_matrix <- fitted_prob %>%
+  select(-prob_pois) %>% 
+  pivot_wider(names_from = age.category, values_from = prob_binom) %>% 
+  select(-practice_id) %>% 
+  as.matrix
+
+binom_rel_prob <- binom_matrix / rowSums(binom_matrix,na.rm=T)
+
+plot(binom_rel_prob[,4])
+
+binom_to_plot <- as_tibble(binom_rel_prob) %>%
+  rowid_to_column(var="practice") %>% 
+  pivot_longer(colnames(binom_rel_prob))
+
+ggplot(data=binom_to_plot %>% 
+         filter(practice%in%c(1:10)),
+       aes(y=value,x=name,color=as.factor(practice)))+
+  geom_point()
+
+
+pois_matrix <- fitted_prob %>% 
+  select(-prob_binom) %>% 
+  pivot_wider(names_from = age.category, values_from = prob_pois) %>% 
+  select(-practice_id) %>% 
+  as.matrix
+
+pois_rel_prob <- pois_matrix / rowSums(pois_matrix,na.rm=T)
+
+plot(pois_rel_prob[,4])
+
+pois_to_plot <- as_tibble(pois_rel_prob) %>% 
+  pivot_longer(colnames(pois_rel_prob))
+ggplot(data=pois_to_plot,aes(y=value,x=name))+geom_point()
+
+
+## CHECK CORRESPONDACNE BETWEEN COMPUTED AND FITTED 
+test <- doubledata %>% 
+  filter(!is.na(ncases)) %>% 
+  select(ID,sex,age.category,increased_compensation,practice_id,probs_binom,probs_pois) %>% 
+  left_join(computed_probs %>% select(-c(6,8)),
+            by=c("ID","sex","age.category","increased_compensation","practice_id"))
+hist(test$prob_binom-test$probs_binom)
+hist(test$prob_pois-test$probs_pois)
+
+
+
+## EMPIRISCHE VERHOUDINGEN
+emp_data <-doubledata %>% 
+  # mutate_if(is.factor,as.character) %>% 
+  filter(!is.na(ncases),
+         sex=="M",
+         increased_compensation=="No",
+         nis_code==11002) %>% 
+  group_by(age.category) %>% 
+  summarize(nlrti=sum(ncases),
+            npatients = sum(npatients),
+            pct_lrti = nlrti/npatients) %>% 
+  ungroup() %>% 
+  mutate(rel_prob = pct_lrti / sum(pct_lrti))
+
+
+# We have shown the property of Poisson model i.e. independence of practice / 
+# vaste verhouding rel_prob. 
+# This property is also kind of present in the binomial model (appr. 30% for (-1,5])
+# Therefroe, we do not expect large differences between both models. 
+# However, it is strange that de verhoudingen verschillen tussen beide modellen
+# Next steps: 
+# 1) Check if models are correctly implemented by looking at predicted LRTI cases
+# for the intego population (not the total derived pop)
+# 2) If correct -> What is causing this difference ? 
+
+
+#--------------------- 1) PREDICTED LRTI CASES INTEGO POP----------------------#
+
+# intego_pop <- doubledata %>% filter(!is.na(ncases))
+
+get_predicted_cases <- function(inla_model,model_data){
+  predicted.values.mean <- c()
+  for(i in 1:length(inla_model$marginals.fitted.values)){
+    predicted.values.mean[i] <- 
+      inla.emarginal(function(x) x*model_data$npatients[i],
+                     inla_model$marginals.fitted.values[[i]])
+  }
+  
+  return(predicted.values.mean)
+}
+
+binom_predicted_cases <- get_predicted_cases(inla.out_noiid_binom,doubledata)
+# pois_predicted_cases <- get_predicted_cases(inla.out_noiid_pois,doubledata)
+pois_predicted_cases <- inla.out_noiid_pois$summary.fitted.values$mean
+
+
+hist(binom_rel_prob)
+hist(pois_predicted_cases)
+
+intego_pop_preds <- doubledata %>%
+  mutate(binom_preds = binom_predicted_cases,
+         pois_preds = pois_predicted_cases) %>% 
+  filter(!is.na(ncases)) %>% 
+  select(-c(8:16))
+
+plot(intego_pop_preds$ncases,intego_pop_preds$binom_preds)
+plot(intego_pop_preds$ncases,intego_pop_preds$pois_preds)
+
+sum(intego_pop_preds$ncases)
+sum(intego_pop_preds$binom_preds)
+sum(intego_pop_preds$pois_preds)
+
+ggplot(data=intego_pop_preds %>% 
+         group_by(age.category) %>% 
+         summarize(ncases=sum(ncases),
+                   binom_preds = sum(binom_preds),
+                   pois_preds = sum(pois_preds)) %>% 
+         pivot_longer(cols=c("ncases","binom_preds","pois_preds")),
+       aes(x=age.category,y=value,color=name))+
+  geom_point(alpha=0.4,size=3)+
+  scale_color_discrete(breaks=c("ncases","binom_preds","pois_preds"))+
+  scale_y_continuous(breaks=seq(600,4000,200))+
+  theme_bw()
+
+
+
+#--------------------- 2) Find the cause ----------------------#
+
+
+# 1) There has to be a group for which the verhouding is < 20% otherwise (i) would not be possible 
+# --> Which group? 
+# 2) Actual data: compute rel_prob voor praktijken met minstens 5000 patients 
+# 3) Compute verhoudingen in leeftijdsgroepen zonder (-1,5] en (85,110] beause
+# they are less frequent
+
+practice_age <- doubledata %>% 
+  filter(!is.na(ncases)) %>% 
+  # filter(sex=="M",increased_compensation=="No",nis_code==11002) %>% 
+  group_by(practice_id) %>% 
+  mutate(npatients_practice = sum(npatients)) %>% 
+  ungroup() %>% 
+  filter(npatients_practice >= 2000) %>% 
+  group_by(practice_id,age.category) %>% 
+  summarize(ncases=sum(ncases),
+         npatients = sum(npatients),
+         emp_prob = ncases/npatients) %>% 
+  select(-ncases,-npatients) %>% 
+  pivot_wider(names_from = age.category,values_from = emp_prob) %>% 
+  ungroup() %>% 
+  select(-practice_id) %>%
+  as.matrix
+
+# practice_age <- practice_age / rowSums(practice_age)
+
+age_17_50 <- practice_age[,"(16,50]"]
+
+practice_age_matrix <- as_tibble(practice_age / age_17_50)
+
+ggplot(data=practice_age_matrix %>% 
+         rowid_to_column() %>% 
+         pivot_longer(cols=colnames(practice_age_matrix)), 
+       aes(x=name,y=value,color=as.factor(rowid))) +
+  geom_point()+
+  scale_color_discrete("Practices (N>=5000)")+
+  scale_y_continuous(name="Ratio wrt (16,50])",breaks=seq(0,10,1))+
+  labs(x="Age group")
+
+
+
+sex_age <- doubledata %>% 
+  filter(!is.na(ncases)) %>% 
+  # filter(sex=="M",increased_compensation=="No",nis_code==11002) %>% 
+  group_by(sex) %>% 
+  mutate(npatients_sex = sum(npatients)) %>% 
+  ungroup() %>% 
+  # filter(npatients_sex >= 2000) %>% 
+  group_by(sex,age.category) %>% 
+  summarize(ncases=sum(ncases),
+            npatients = sum(npatients),
+            emp_prob = ncases/npatients) %>% 
+  select(-ncases,-npatients) %>% 
+  pivot_wider(names_from = age.category,values_from = emp_prob) %>% 
+  ungroup() %>% 
+  column_to_rownames(var="sex") %>% 
+  # select(-sex) %>%
+  as.matrix
+
+# sex_age <- sex_age / rowSums(sex_age)
+
+age_17_50 <- sex_age[,"(16,50]"]
+
+sex_age_matrix <- as_tibble(sex_age / age_17_50,rownames=NA)
+
+ggplot(data=sex_age_matrix %>% 
+         rownames_to_column(var="rowid") %>% 
+         pivot_longer(cols=colnames(sex_age_matrix)), 
+       aes(x=name,y=value,color=as.factor(rowid))) +
+  geom_point()+
+  scale_color_discrete("Gender")+
+  scale_y_continuous(name="Ratio wrt (16,50])",breaks=seq(0,10,1))+
+  labs(x="Age group")
+
+
+################################################################################
+# Random subset practices 
+################################################################################
+
+
+compute_results_inla <- function(practice_sub,model_data,formula){
+  
+  data_model <- model_data %>% 
+    filter(practice_id %in% practice_sub) 
+  
+  inla.out <- inla(formula,
+                   family="binomial",
+                   data =data_model ,
+                   Ntrials = npatients, # N Bernouilli experiments 
+                   control.predictor = list(link=1),
+                   control.compute=list(waic=T,dic=T,config=T)
+  )
+  
+  fe <- get_fixed_effects_inla(inla.out)
+  re <- get_random_effects_inla(inla.out)
+  
+  re <- do.call(rbind,re) %>% rename(Param=ID)
+  
+  estimates <- rbind(fe,re)
+  
+  predictions <- get_predicted_incidence_inla(inla.out,data_model)
+  
+  
+  return(list(estimates = estimates,predictions=predictions))
+  
+  
+}
+
+############## ICAR + IID + PRACTICE ###########################################
+
+## Simulations
+
+# estimates
+results_simul <- data.frame()
+# predictions
+predictions_simul <- data.frame()
+# Remove NA nis row
+doubledata <- doubledata %>% filter(!is.na(practice_id))
+# Sort all unique practices --> also do this in orevious analysis to be able to compare
+practices <- sort(as.character(unique(doubledata$practice_id)))
+# 20 iterations
+simul_subset_practice<-50
+
+
+s <- Sys.time()
+# Execute
+for(k in 1:simul_subset_practice){
+  
+  cat("Simulation ",k,"/",simul_subset_practice,"\n")
+  set.seed(k)
+  practice_sub<- practices[runif(length(practices))>0.5]
+  
+  
+  out <- compute_results_inla(practice_sub,doubledata,formula_best)
+  
+  results_simul <- rbind(results_simul,
+                         out$estimates %>%
+                           mutate(iteration=k))
+  
+  predictions_simul <- rbind(predictions_simul,
+                             out$predictions %>% 
+                               mutate(iteration=k))
+  
+}
+e <- Sys.time()
+time <- e-s
+
+# Save results
+saveRDS(results_simul,"./Code/simul_practice_subset_se_50.rds")
+saveRDS(predictions_simul,"./Code/simul_practice_subset_se_predictions_50.rds")
+
+it=1
+data <- predictions_simul %>% filter(iteration==it)
+plot_breaks <- Fisher_bin(data$pred,8)
+data$ncases <- plot_breaks
+
+plotclr <- rev(brewer.pal(nclr,"RdYlGn"))
+
+colnames(map_sf.shp)
+map_sf.ncases <- map_sf.shp %>% 
+  left_join(data,by=c("NISCODE"="nis_code"))
+
+
+ggplot(data = map_sf.ncases)+
+  theme_void()+
+  geom_sf(aes(fill=ncases))+
+  scale_fill_manual("LRTI cases in 100.000 inhabitants",values=plotclr)+
+  labs(title="Incidence LRTI 2019")
+
+
+
+############## ICAR + PRACTICE ###########################################
+
+
+
+# estimates
+results_simul <- data.frame()
+# predictions
+predictions_simul <- data.frame()
+# Remove NA nis row
+doubledata <- doubledata %>% filter(!is.na(practice_id))
+# Sort all unique practices --> also do this in orevious analysis to be able to compare
+practices <- sort(as.character(unique(doubledata$practice_id)))
+# 20 iterations
+simul_subset_practice<-50
+
+# Execute
+for(k in 1:simul_subset_practice){
+  
+  cat("Simulation ",k,"/",simul_subset_practice,"\n")
+  set.seed(k)
+  practice_sub<- practices[runif(length(practices))>0.5]
+  
+  
+  out <- compute_results_inla(practice_sub,doubledata,formula_noiid)
+  
+  results_simul <- rbind(results_simul,
+                         out$estimates %>%
+                           mutate(iteration=k))
+  
+  predictions_simul <- rbind(predictions_simul,
+                             out$predictions %>% 
+                               mutate(iteration=k))
+  
+}
+
+
+saveRDS(results_simul,"./Code/simul_practice_subset_se_no_iid_50.rds")
+saveRDS(predictions_simul,"./Code/simul_practice_subset_se_predictions_no_iid_50.rds")
+
+
+
+
+
+################################################################################
+#### ANALYSIS
+#########
+
+
+iid_estimates <-readRDS("./Code/simul_practice_subset_se_50.rds")
+no_iid_estimates <-readRDS("./Code/simul_practice_subset_se_no_iid_50.rds")
+iid_preds <-readRDS("./Code/simul_practice_subset_se_predictions_50.rds")
+no_iid_preds <-readRDS("./Code/simul_practice_subset_se_predictions_no_iid_50.rds")
+
+# previous random subse
+old_estimates <- readRDS("./Code/simul_practice_subset.rds")
+
+
+################## FIXED EFFECTS ###############################################
+
+
+## ID MAPPING 
+nis_id <- map.shp@data %>% select(nis_code = NISCODE,name=NAAM,ID)
+
+iid_estimates <- iid_estimates %>% 
+  rownames_to_column(var="param") %>% 
+  mutate(param = ifelse(str_detect(param,"ID2"),"ID2",
+                        ifelse(str_detect(param,"ID"),"ID",
+                               ifelse(str_detect(param,"practice_id"),"practice_id",param)))) %>% 
+  left_join(nis_id %>% mutate(ID=as.character(ID)),by=c("Param"="ID"))
+
+
+no_iid_estimates <- no_iid_estimates %>% 
+  rownames_to_column(var="param") %>% 
+  mutate(param = ifelse(str_detect(param,"ID2"),"ID2",
+                        ifelse(str_detect(param,"ID"),"ID",
+                               ifelse(str_detect(param,"practice_id"),"practice_id",param)))) %>% 
+  left_join(nis_id %>% mutate(ID=as.character(ID)),by=c("Param"="ID"))
+# 
+# old_estimates <- old_estimates %>% 
+#   rownames_to_column(var="param") %>% 
+#   mutate(param = ifelse(str_detect(param,"ID2"),"ID2",
+#                         ifelse(str_detect(param,"ID"),"ID",
+#                                ifelse(str_detect(param,"practice_id"),"practice_id",param))),
+#          type="") %>% 
+#   left_join(nis_id %>% mutate(ID=as.character(ID)),by=c("Param"="ID"))
+
+param_estimates <- bind_rows(iid_estimates %>% 
+                               mutate(type="iid"),
+                             no_iid_estimates %>% 
+                               mutate(type="icar"))
+
+# param_estimates <- old_estimates
+
+
+ggplot(data=param_estimates %>% filter(!param%in%c("ID","ID2","practice_id")),
+       aes(group=Param,y=Mean,x=as.factor(iteration),colour=type))+ 
+  geom_point()+
+  geom_errorbar(aes(ymin = `0.025Q`, ymax = `0.975Q`),width=0,size=1,alpha=0.5)+
+  facet_wrap(~Param)+
+  geom_hline(yintercept=1)+
+  labs(x="",y="Odds ratio",title="Fixed Effects Estimates (Odds) - No difference when iid is included")+
+  theme(legend.position = "bottom")
+
+ggplot(data=param_estimates %>% filter(!param%in%c("ID","ID2","practice_id")),
+       aes(x=Param,y=Mean,colour=type))+
+  scale_y_continuous(breaks=seq(0,6,1))+
+  geom_boxplot()+
+  geom_jitter(alpha=0.5)+
+  coord_flip()+
+  labs(y="Estimate (Odds)",title="FE Estimate Distribution - No difference")
+
+
+
+################## RANDOM EFFECTS ###############################################
+
+
+## SPATIALLY STRUCTURED 
+
+ggplot(data=param_estimates %>% 
+         filter(param%in%c("ID"),Param%in%seq(260,275,1)),
+       aes(x=name,y=Mean,colour=type))+
+  # scale_y_continuous(breaks=seq(0,6,1))+
+  geom_boxplot()+
+  geom_jitter(alpha=0.5)+
+  labs(x="",y="Estimate")+
+  coord_flip()
+
+
+communities <- seq(2,2,1) # 265 = Hasselt 
+ggplot(data=param_estimates %>% filter(param%in%c("ID"),Param%in%communities),
+       aes(y=Mean,x=as.factor(iteration),colour=type))+ 
+  geom_point()+
+  geom_errorbar(aes(ymin = `0.025Q`, ymax = `0.975Q`),width=0,size=1,alpha=0.8)+
+  facet_wrap(~name)+
+  geom_hline(yintercept=1)+
+  labs(x="",y="Odds ratio",title="Spatial Structured Random Effect - Model type effect")+
+  theme(legend.position = "bottom")
+
+
+## Lets have a look at iteration 28 and 29
+it28 <- param_estimates %>% filter(iteration==28)
+it29 <- param_estimates %>% filter(iteration==29)
+test <- rbind(it28 %>% mutate(it=28),
+              it29 %>% mutate(it=29))
+
+type_names <- list(
+  "icar"="Only spatially structured",
+  "iid"="With IID"
+)
+
+type_labeller <- function(variable,value){
+  return(type_names[value])
+}
+ggplot(data=test %>% filter(param=="ID")
+       ,aes(x=Param,y=Mean,colour=as.factor(it)))+
+  geom_point()+
+  facet_wrap(~type,ncol=1,labeller=type_labeller)
+
+# Ad practice effect to above plot without iid 
+data_est <- test %>% 
+  filter(type=="icar")
+
+# Read practice location 
+practice_locations <- readRDS("practice_location_data.rds")
+
+# Keep practice and nis 
+practice_nis <- practice_locations %>% select(practice_id,nis_code) %>% 
+  # Add estimations random effect 
+  left_join(data_est %>% select(Param,Mean,iteration),by=c("practice_id"="Param"))
+
+# data to plot 
+library(scales)
+data_to_plot <- data_est %>% filter(param%in%c("ID")) %>% ungroup() %>%  
+  left_join(practice_nis %>% mutate(nis_code=as.character(nis_code)),by=c("nis_code","iteration")) %>% 
+  #rescale practice estimates to ID estimates 
+  group_by(iteration) %>% 
+  mutate(Mean.y_scaled = rescale(Mean.y,c(min(Mean.x,na.rm=T),max(Mean.x,na.rm=T))),
+         type=ifelse(is.na(Mean.y_scaled),"no practice","practice"),
+         Mean.y_scaled=ifelse(is.na(Mean.y_scaled),1,Mean.y_scaled))
+
+
+# plot 
+
+ggplot(data=data_to_plot %>% filter(iteration==28),aes(x=as.integer(Param),y=Mean.y_scaled))+
+  geom_line(aes(y=Mean.x,color="Spatial Effect"),alpha=0.8)+
+  geom_point(aes(colour=type),alpha=0.8)+
+  geom_line(colour="blue",linetype="dashed",alpha=0.8,show.legend=F)+
+  scale_color_manual("Random Effect",
+                     values=c("Spatial Effect"="black","no practice"="grey90",
+                              "practice"="blue"))+
+  theme_bw()+
+  theme(legend.position="bottom")+
+  labs(x="NIS Code",y="Mean estimate (scaled)",
+       title="Spatial NIS Effect and Practice Effect: Iteration 29")
+
+
+ggplot(data=data_to_plot %>% filter(iteration==28,!is.na(practice_id)),aes(x=Param,y=Mean.y_scaled))+
+  geom_point(aes(y=Mean.x,color="Spatial Effect"),alpha=0.8)+
+  geom_point(aes(colour=type),alpha=0.8)+
+  scale_color_manual("Random Effect",
+                     values=c("Spatial Effect"="black",
+                              "practice"="blue"))+
+  theme_bw()+
+  theme(legend.position="bottom")+
+  labs(x="NIS Code",y="Mean estimate (scaled)",
+       title="Spatial NIS Effect and Practice Effect: Iteration 29")
+
+ggplot(data=data_to_plot %>% filter(iteration==29),aes(x=Mean.x,y=Mean.y_scaled))+
+  geom_point()+
+  stat_smooth()
+
+
+
+it28_practice <- it28 %>% 
+  filter(param=="practice_id",type=="icar") %>% 
+  distinct(practice_id=Param)
+it29_practice <- it29 %>% 
+  filter(param=="practice_id",type=="icar") %>% 
+  distinct(practice_id=Param)
+practice_non_overlap <- it29_practice$practice_id[!it29_practice$practice_id%in%
+                                                    it28_practice$practice_id]
+
+
+## Collect all practices in low estimates iterzations 
+it_deviant <- c(2,3,12,18,19,21,35,40,41)
+
+n_comb = 4
+a=param_estimates %>% 
+  filter(param=="practice_id",iteration%in%it_deviant) %>% 
+  group_by(iteration) %>% 
+  summarize(new=paste(unique(combn(Param,n_comb,toString)),collapse = "/"))
+
+tmost_freq_combo <- names(sort(table(unlist(strsplit(a$new,"/"))),decreasing=TRUE)[1])
+
+b=param_estimates %>% 
+  filter(param=="practice_id",!iteration%in%it_deviant) %>% 
+  group_by(iteration) %>% 
+  summarize(new=paste(unique(combn(Param,n_comb,toString)),collapse = "/"))
+
+
+b<-b %>% mutate(ok = ifelse(str_detect(new,most_freq_combo),1,0))
+table(b$ok)
+
+
+## PLOT POP MAP for differnet itertions 
+set.seed(k)
+practice_sub<- practices[runif(length(practices))>0.5]
+
+
+map_sf.shp <- get_sf_map_flanders()
+map_sf.shp <- map_sf.shp %>% 
+  arrange(NISCODE)
+map_sf.shp$ID=1:nrow(map_sf.shp)
+
+set.seed(29)
+practice_sub<- practices[runif(length(practices))>0.5]
+data29 <- lrti_data.inla %>% 
+  filter(practice_id%in%practice_sub) %>% 
+  group_by(nis_code) %>% 
+  summarize(npatients=sum(npatients),
+            nlrti=sum(nlrti)) %>% 
+  mutate(nis_code=as.character(nis_code))
+
+pop29<-ggplot(data=map_sf.shp %>% 
+                left_join(data29,by=c("NISCODE"="nis_code")))+
+  theme_void()+
+  geom_sf(aes(fill=nlrti))+
+  scale_fill_viridis_c("it 29",trans="log")
+
+set.seed(1)
+practice_sub<- practices[runif(length(practices))>0.5]
+data1 <- lrti_data.inla %>% 
+  filter(practice_id%in%practice_sub) %>% 
+  group_by(nis_code) %>% 
+  summarize(npatients=sum(npatients),
+            nlrti=sum(nlrti)) %>% 
+  mutate(nis_code=as.character(nis_code))
+
+pop1<-ggplot(data=map_sf.shp %>% 
+               left_join(data1,by=c("NISCODE"="nis_code")))+
+  theme_void()+
+  geom_sf(aes(fill=nlrti))+
+  scale_fill_viridis_c("it 1",trans="log")
+
+dataall <- lrti_data.inla %>% 
+  group_by(nis_code) %>% 
+  summarize(npatients=sum(npatients),
+            nlrti=sum(nlrti)) %>% 
+  mutate(nis_code=as.character(nis_code))
+
+popall<-ggplot(data=map_sf.shp %>% 
+                 left_join(dataall,by=c("NISCODE"="nis_code")))+
+  theme_void()+
+  geom_sf(aes(fill=nlrti))+
+  scale_fill_viridis_c("all",trans="log")
+
+library(cowplot)
+plot_grid(pop1,pop29,popall,ncol=1)
+
+
+## PRACTICE
+
+# Get sf map
+map_sf.shp <- get_sf_map_flanders()
+map_sf.shp <- map_sf.shp %>% 
+  arrange(NISCODE)
+map_sf.shp$ID=1:nrow(map_sf.shp)
+
+map_sf.shp_center <- st_centroid(map_sf.shp)
+
+# Get practice coordinates 
+practice_coordinates <- readRDS("./practice_location_data.rds")
+
+# Plot practices of "afwijkende" schattingen
+iterations_deviant <- c(28)#,12,18,19,21,35,40,41)
+iterations_deviant_old <- c(9,15)
+
+
+practice_re_deviant <- practice_coordinates %>% 
+  left_join(param_estimates %>% 
+              filter(iteration%in%iterations_deviant,
+                     param=="practice_id",
+                     type=="iid"),
+            by=c("practice_id"="Param")) %>% 
+  group_by(practice_id) %>% 
+  summarize(n = n(),
+            mean = mean(Mean,na.rm=T),
+            lon=lon[1],
+            lat=lat[1])
+
+ggplot(data = map_sf.shp) +
+  theme_void() +
+  geom_sf(fill = 'gray', color = 'gray', alpha = .1) +
+  geom_point(data = practice_re_deviant %>% filter(!is.na(mean)), 
+             aes(x = lon, y = lat, size=n, colour=mean,shape=(n>=2)), 
+             alpha = 0.8)+
+  # geom_point(data=practice_re_deviant %>% filter(is.na(mean)), 
+  #            aes(x = lon, y = lat), fill=NA,colour="red")+
+  theme(legend.position = "right") + 
+  scale_colour_continuous("practice_id",type="viridis") + 
+  scale_size(guide='none')+
+  labs(title="Practice Random Effect (Odds ratio)")
+
+plot_ran
+
+
+# model without that one pracitce
+
+inla.out_best_test <- inla(formula_best,
+                           family="binomial",
+                           data = doubledata %>% 
+                             filter(practice_id!="64d17fa0-0d35-478d-bcb3-9b4d48f6b8fd"),
+                           Ntrials = npatients, # N Bernouilli experiments 
+                           control.predictor = list(link=T),
+                           control.compute=list(waic=T,dic=T,config=T)
+)
+fe <- get_fixed_effects_inla(inla.out_best_test)
+re <- get_random_effects_inla(inla.out_best_test)
+plot_random_effects(re)
+
+
+predictions_iid <-readRDS("./Code/simul_practice_subset_se_predictions.rds")
+predictions_no_iid <-readRDS("./Code/simul_practice_subset_se_predictions_no_iid.rds")
+
+
+for(i in 1:20){
+  
+  a<-plot_predicted_incidence(predictions_iid %>% filter(iteration==i))
+  ggsave(paste0("./Codeincidence_iteration_",i,".png"),a)
+  
+}
+
+
+
+###### SCATTERPLOT NIS versus practice effect 
+
+
+est <- param_estimates %>% 
+  filter(iteration==7,type=="iid",param%in%c("ID","practice_id"))
+
+est_nis <- est %>% filter(param=="ID") %>% 
+  select(nis_code,ID=Param,Mean)
+est_pract <- est %>% filter(param=="practice_id") %>% 
+  select(practice_id=Param,Mean)
+
+data_sub <- lrti_data.inla %>% 
+  filter(practice_id %in% est_pract$practice_id) %>% 
+  ungroup() %>% 
+  distinct(nis_code,practice_id)
+
+data <- data_sub %>% 
+  left_join(est_nis %>% mutate(nis_code=as.integer(nis_code)),by='nis_code') %>% 
+  left_join(est_pract,by="practice_id")
+
+ggplot(data=data,aes(x=Mean.y,y=Mean.x))+geom_point()
+
+practices <- param_estimates %>% 
+  filter(type=="iid",param%in%c("practice_id"))
+
+ggplot(data=practices,aes(x=iteration,y=Mean,colour=Param))+geom_point()+
+  theme(legend.position = "none")
+
+
+
+
+
+
+### Look at iteratin 28 and 29 
+
+it = 29
+data <- param_estimates %>% filter(type=="icar",iteration%in%c(it),
+                                   param%in%c("ID","practice_id"))
+
+# PRactice and nis 
+
+nis_pract <- lrti_data.inla %>% 
+  ungroup() %>% 
+  distinct(nis_code,practice_id)
+
+# plot(st_jitter(st_geometry(map_sf.shp_center),factor=0.1))
+
+# ?split
+# data_split <- split(data,as.factor(data$iteration))
+
+data_est <- nis_pract %>% 
+  left_join(data %>% mutate(nis_code=as.integer(nis_code)),by=c("nis_code")) %>% 
+  left_join(data,by=c("practice_id"="Param"))
+
+est29 <- data_est %>% filter(iteration.x==it)
+
+
+ggplot(data=est29,aes(x=as.integer(Param)))+
+  geom_point(aes(y=Mean.x,colour="NIS"))+
+  geom_point(aes(y=Mean.y,colour="Practice"),alpha=0.2)+
+  labs(x="NIS Code",y="Estimated Effect")+
+  scale_color_manual("Random Effect",values=c("NIS"="black","Practice"="red"))+
+  theme_bw()+
+  theme(legend.position="bottom")
+
+library(scales)
+test <- rescale(est29$Mean.y,to=c(min(est29$Mean.x,max(est29$Mean.x))))
+est29_scaled <- est29 %>% 
+  mutate(Mean.y_scaled = 
+           rescale(Mean.y,to=c(min(est29$Mean.x),max(est29$Mean.x))))
+
+
+ggplot(data=est29_scaled,aes(x=as.integer(Param)))+
+  geom_point(aes(y=Mean.x,colour="NIS"))+
+  geom_point(aes(y=Mean.y_scaled,colour="Practice"),alpha=0.2)+
+  labs(x="NIS Code",y="Estimated Effect")+
+  scale_color_manual("Random Effect",values=c("NIS"="black","Practice"="red"))+
+  theme_bw()+
+  theme(legend.position="bottom")
+
+

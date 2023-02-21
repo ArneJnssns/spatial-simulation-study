@@ -1,0 +1,555 @@
+################################################################################
+################################################################################
+# MODEL SELECTION
+################################################################################
+################################################################################
+rm(list=ls())
+
+# Libraries
+library(dplyr)
+library(lubridate)
+library(tibble)
+
+library(INLA)
+library(rgdal)
+library(spdep)
+
+library(ggplot2)
+library(RColorBrewer)
+library(classInt)
+
+# rm(list=ls())
+
+# Setwd
+setwd("Z:/Projects_Arne/2021_Simulation_Spatial")
+
+# Avoid scientific notation
+options(scipen=999)
+
+
+# READ DATA 
+################################################################################
+
+## LRTI DATA (pfizer project)
+lrti_data <- readRDS("./Data/lrti_data.rds")
+str(lrti_data)
+
+## POST-TO-NIS mapping 
+nis <- "Z:/Intego_Data/Spatial_Data/Other_Files/post_nis_2019.csv" 
+nis <- read.csv2(nis,sep=",") %>% 
+  # Flanders
+  filter(region_label_nl == "Vlaams G") %>% 
+  select(postal_code, nis_code = municipality_nis_code) %>% 
+  arrange(nis_code)
+
+## MAP as polygon object (rgdal) (mabe also possible with sf object?)
+map.shp <- readOGR("Z:/Intego_Data/Spatial_Data/Shape_Files/Flanders_2019/Refgem.shx")
+plot(map.shp)
+
+# All nis present? 
+sum(nis$nis_code %in% map.shp@data$NISCODE == F)
+
+
+#### PREPARE DATA 
+################################################################################
+
+# RESPONSE: number of LRTI cases
+# COVARIATES:
+# - FIXED: GENDER, AGE, SOCIO-ECON, VACCINE(?), ANTI-MICROB AG(?), ...(?)
+# - RANDOM: NIS (spatially strucutred), random iid and/or practice_id, others(?)
+
+
+## COMORBIDITY VARIABLE : RISK LEVEL - HIGH, MEDIUM, LOW
+# High risk - column names  
+icpc_high_risk <- c("B90","B72","B73","B74","B78")
+icd10_high_risk <- c("D73.0","G96.0","Z96.2")
+atc_high_risk <- c("immunosuppressant","glucocorticoids")
+
+high_risk <- c(icpc_high_risk,icd10_high_risk,atc_high_risk)
+
+# Medium risk - column names 
+icpc_comorb <- c("R79","R89","R95","R96","K73","K74","K75","K76","K77","K78",
+                 "K82","K83","K89","K90","K92","D97","P15","T89","T90","N86",
+                 "N87")
+icd10_comorb <- c("G71.0","G70.0","G73.1","G70","G71","G72","G73","G12.2",
+                  "G60.0")
+gfr_comorb <- c("GFR_risk")
+
+medium_risk <- c(icpc_comorb,icd10_comorb,gfr_comorb)
+
+# Create comorb categories 
+lrti_data <- lrti_data %>%
+  unite("high_risk", all_of(high_risk),remove=T) %>% 
+  unite("medium_risk", all_of(medium_risk),remove=T) %>% 
+  # case_when avoids that high risk patient with medium risk comorb are assigned to medium risk group
+  mutate(risk_group = case_when(
+    str_detect(high_risk,"1") ~ "high",
+    str_detect(medium_risk,"1")~ "medium",
+    TRUE ~ "low")) %>% 
+  select(-high_risk,-medium_risk)
+
+
+## VARIABLES OF INTEREST 
+lrti_data <- lrti_data %>% select(patient_id, event,
+                                  sex, age, increased_compensation, risk_group, postal_code,practice_id)
+str(lrti_data)
+
+# DROP NA (30.931 with no main practice )
+lrti_data_na <- drop_na(lrti_data)
+
+# MAPPING
+lrti_data_nis <- lrti_data %>% 
+  left_join(nis, by="postal_code")
+
+table(is.na(lrti_data_nis$nis_code))
+
+# DROP missing nis_code (7.314 patients)
+# lrti_data_nis <- drop_na(lrti_data_nis,nis_code) 
+
+colnames(lrti_data_nis)
+
+## AGE CATEGORIES
+# based on vaccination recommendations + inclusion of children
+age_breaks <- c(-1,5,16,50,65,85,110) 
+
+lrti_data.event <- lrti_data_nis %>% 
+  filter((sex == "M" | sex == "F"), age %in% c(0:111)) %>% 
+  mutate(age.category = cut(age, breaks = age_breaks),
+         age.category = relevel(age.category,ref="(16,50]"))
+
+## REMOVE voeren and herstappe (as Oana did)
+remove_nis <- c(73109,73028)
+
+view(lrti_data.event %>% filter(nis_code%in%remove_nis))
+
+lrti_data.event <- lrti_data.event %>% filter(!nis_code%in%remove_nis)
+
+str(lrti_data.event)
+
+## FACTORS
+lrti_data.event <- lrti_data.event %>% 
+  mutate(sex = factor(sex),
+         increased_compensation=factor(increased_compensation,levels=c("No","Yes","Unknown")),
+         risk_group = factor(risk_group,levels=c("low","medium","high")))
+
+str(lrti_data.event)
+
+## SUMMARIZE for use in inla
+lrti_data.inla <- lrti_data.event %>% 
+  group_by(nis_code,sex,age.category,increased_compensation,risk_group,practice_id) %>% 
+  summarise(nlrti = sum(event==1),npatients = n())
+
+
+## PREPARE MAP DATA
+map.shp <- map.shp[order(map.shp@data$NISCODE),] 
+
+# RANDOM EFFECTS for each area
+map.shp@data$ID <- 1:nrow(map.shp@data)
+
+# Create adjecency matrix based on the shape file 
+# set rows names of neighbor list to the ID variable
+map.nb <- poly2nb(map.shp,row.names=map.shp@data$ID,queen=T)
+
+## Convert the adjency matrix into a file in the INLA format
+# Save the neighbor list to an external file, INLA needs the list this way
+nb2INLA(map.nb,file="map.gra")
+
+## MERGE data with map
+# inla_data <- function(df,map){
+#   out <- merge(df,map@data, by.x="municipality_nis_code", by.y = "NISCODE",all=T)
+#   
+# }
+
+
+lrti_data.inla <- merge(lrti_data.inla,map.shp@data, by.x="nis_code",by.y="NISCODE",all=T)
+
+
+
+#### MODELS
+################################################################################
+
+get_model_summary <- function(fit_out){
+  
+  marginals <- data.frame(matrix(NA,nrow=length(fit_out$marginals.fixed)+4,ncol=5))
+  marginals[,1] <-c(names(fit_out$marginals.fixed),c("WAIC","DIC","MMLIK","Eff no par (WAIC)"))
+  
+  for (i in 1:length(fit_out$marginals.fixed)){
+    est <- inla.zmarginal(inla.tmarginal(fun=function(x) exp(x), fit_out$marginals.fixed[[i]]))
+    marginals[i,2] <- est$mean
+    marginals[i,3] <- est$sd
+  }
+  
+  
+  # summary marginal distribution: HPD interval
+  for (i in 1:length(fit_out$marginals.fixed)){
+    
+    m <- inla.tmarginal(function(x) exp(x), fit_out$marginals.fixed[[i]])
+    hpd <- inla.hpdmarginal(.95,marginal=m)
+    marginals[i,4] <- hpd[,1]
+    marginals[i,5] <- hpd[,2]
+    
+  }
+  
+  names(marginals) = c("Param","Mean","Std","0.025Q","0.975Q")
+  
+  # marginals[length(fit_out$marginals.fixed)+1:length(fit_out$marginals.fixed)+4,1] <- c("WAIC","DIC","MMLIK","Eff no par (WAIC)")
+  marginals[length(fit_out$marginals.fixed)+1,2] <- fit_out$waic$waic
+  marginals[length(fit_out$marginals.fixed)+2,2] <- fit_out$dic$dic
+  marginals[length(fit_out$marginals.fixed)+3,2] <- fit_out$misc$configs$max.log.posterior
+  marginals[length(fit_out$marginals.fixed)+4,2] <- fit_out$waic$p.eff
+  
+  return(marginals)
+  
+  
+}
+
+
+# 1) Only fixed effects 
+formula1 <- nlrti ~ sex + age.category + increased_compensation
+
+inla.out1 <- inla(formula1,
+                     family="binomial",
+                     data = lrti_data.inla,
+                     Ntrials = npatients, # N Bernouilli experiments 
+                     control.predictor = list(compute=T),
+                     control.compute=list(waic=T,dic=T,config=T))
+
+summary(inla.out1)
+sum1 <-get_model_summary(inla.out1)
+
+
+# 2) Only fixed effects + practice_id as fixed effect 
+formula2 <- nlrti ~ sex + age.category + increased_compensation + practice_id
+
+inla.out2 <- inla(formula2,
+                  family="binomial",
+                  data = lrti_data.inla,
+                  Ntrials = npatients, # N Bernouilli experiments 
+                  control.predictor = list(compute=T),
+                  control.compute=list(waic=T,dic=T,config=T))
+
+summary(inla.out2)
+sum2<-get_model_summary(inla.out2)
+
+
+# 3) nis ID as random Gaussian
+formula3 <- nlrti ~ sex + age.category + increased_compensation +
+  f(ID, model="iid")#constr = 0)
+
+inla.out3 <- inla(formula3,
+                  family="binomial",
+                  data = lrti_data.inla,
+                  Ntrials = npatients, # N Bernouilli experiments 
+                  control.predictor = list(compute=T),
+                  control.compute=list(waic=T,dic=T,config=T))
+
+summary(inla.out3)
+sum3 <- get_model_summary(inla.out3)
+
+
+# 4) nis as BYM (spatially structured + unstructured)
+formula4 <- nlrti ~ sex + age.category + increased_compensation +
+  f(ID, model="bym", graph="map.gra",scale.model=T)
+
+inla.out4 <- inla(formula4,
+                  family="binomial",
+                  data = lrti_data.inla,
+                  Ntrials = npatients, # N Bernouilli experiments 
+                  control.predictor = list(compute=T),
+                  control.compute=list(waic=T,dic=T,config=T))
+
+summary(inla.out4)
+sum4<-get_model_summary(inla.out4)
+  
+
+# 5) not BYM but separetely:  BESAG (ICAR) + IID
+formula5 <- nlrti ~ sex + age.category + increased_compensation +
+  f(ID, model="besag", graph="map.gra",scale.model=T)+
+  f(ID2,model="iid")
+
+inla.out5 <- inla(formula5,
+                  family="binomial",
+                  data = lrti_data.inla %>% mutate(ID2=ID),
+                  Ntrials = npatients, # N Bernouilli experiments 
+                  control.predictor = list(compute=T),
+                  control.compute=list(waic=T,dic=T,config=T))
+
+summary(inla.out5)
+sum5<- get_model_summary(inla.out5)
+
+# 6) NIS =  BESAG (ICAR) + Random Gaussian PRACTICE ID
+formula6 <- nlrti ~ sex + age.category + increased_compensation +
+  f(ID, model="besag", graph="map.gra",scale.model=T)+
+  f(practice_id,model="iid")
+
+inla.out6 <- inla(formula6,
+                  family="binomial",
+                  data = lrti_data.inla,
+                  Ntrials = npatients, # N Bernouilli experiments 
+                  control.predictor = list(compute=T),
+                  control.compute=list(waic=T,dic=T,config=T))
+
+summary(inla.out6)
+sum6<-get_model_summary(inla.out6)
+
+# 7) NIS =  BESAG (ICAR) + random spatial +  Random Gaussian PRACTICE ID
+formula7 <- nlrti ~ sex + age.category + increased_compensation +
+  f(ID, model="besag", graph="map.gra",scale.model=T)+
+  f(ID2,model="iid")+
+  f(practice_id,model="iid")
+
+inla.out7 <- inla(formula7,
+                  family="binomial",
+                  data = lrti_data.inla%>% mutate(ID2=ID),
+                  Ntrials = npatients, # N Bernouilli experiments 
+                  control.predictor = list(compute=T),
+                  control.compute=list(waic=T,dic=T,config=T))
+
+summary(inla.out7)
+sum7<-get_model_summary(inla.out7)
+
+# 8) + interaction nis and practice
+
+u <- unique(lrti_data.inla[,c("nis_code","practice_id")])
+u$interaction <- rep((1:nrow(u)))
+lrti_data.inla <- merge(lrti_data.inla,u,by=c("nis_code","practice_id"))
+
+formula8 <- nlrti ~ sex + age.category + increased_compensation +
+  f(ID, model="besag", graph="map.gra",scale.model=T)+
+  f(ID2,model="iid")+
+  f(interaction,model="iid")
+
+inla.out8 <- inla(formula8,
+                  family="binomial",
+                  data = lrti_data.inla%>% mutate(ID2=ID),
+                  Ntrials = npatients, # N Bernouilli experiments 
+                  control.predictor = list(compute=T),
+                  control.compute=list(waic=T,dic=T,config=T))
+
+summary(inla.out8)
+sum8<-get_model_summary(inla.out8)
+
+# 9) interaction without iid
+
+formula9 <- nlrti ~ sex + age.category + increased_compensation + 
+  f(ID, model="besag", graph="map.gra",scale.model=T)+
+  f(interaction,model="iid")
+
+inla.out9 <- inla(formula9,
+                  family="binomial",
+                  data = lrti_data.inla%>% mutate(ID2=ID),
+                  Ntrials = npatients, # N Bernouilli experiments 
+                  control.predictor = list(compute=T),
+                  control.compute=list(waic=T,dic=T,config=T))
+
+summary(inla.out9)
+sum9<-get_model_summary(inla.out9)
+
+# 10) Only practice
+
+formula10 <- nlrti ~ sex + age.category + increased_compensation + 
+  f(practice_id,model="iid")
+
+inla.out10 <- inla(formula10,
+                  family="binomial",
+                  data = lrti_data.inla%>% mutate(ID2=ID),
+                  Ntrials = npatients, # N Bernouilli experiments 
+                  control.predictor = list(compute=T),
+                  control.compute=list(waic=T,dic=T,config=T))
+
+summary(inla.out10)
+sum10<-get_model_summary(inla.out10)
+
+# 11) With comorbidities
+
+formula11 <- nlrti ~ sex + age.category + increased_compensation +risk_group
+
+inla.out11 <- inla(formula11,
+                  family="binomial",
+                  data = lrti_data.inla,
+                  Ntrials = npatients, # N Bernouilli experiments 
+                  control.predictor = list(compute=T),
+                  control.compute=list(waic=T,dic=T,config=T))
+
+summary(inla.out11)
+sum11 <-get_model_summary(inla.out11)
+
+
+# 12) NIS =  BESAG (ICAR) + Random Gaussian PRACTICE ID + comorbidity
+formula12 <- nlrti ~ sex + age.category + increased_compensation + risk_group
+  f(ID, model="besag", graph="map.gra",scale.model=T)+
+  f(practice_id,model="iid")
+
+inla.out12 <- inla(formula12,
+                  family="binomial",
+                  data = lrti_data.inla,
+                  Ntrials = npatients, # N Bernouilli experiments 
+                  control.predictor = list(compute=T),
+                  control.compute=list(waic=T,dic=T,config=T))
+
+summary(inla.out12)
+sum12<-get_model_summary(inla.out12)
+
+# 13) not BYM but separetely:  BESAG (ICAR) + IID
+formula13 <- nlrti ~ sex + age.category + increased_compensation + risk_group
+  f(ID, model="besag", graph="map.gra",scale.model=T)+
+  f(ID2,model="iid")
+
+inla.out13 <- inla(formula13,
+                  family="binomial",
+                  data = lrti_data.inla %>% mutate(ID2=ID),
+                  Ntrials = npatients, # N Bernouilli experiments 
+                  control.predictor = list(compute=T),
+                  control.compute=list(waic=T,dic=T,config=T))
+
+summary(inla.out13)
+sum13<- get_model_summary(inla.out13)
+
+# 14) NIS =  BESAG (ICAR) + random spatial +  Random Gaussian PRACTICE ID
+formula14 <- nlrti ~ sex + age.category + increased_compensation + risk_group
+  f(ID, model="besag", graph="map.gra",scale.model=T)+
+  f(ID2,model="iid")+
+  f(practice_id,model="iid")
+
+inla.out14 <- inla(formula14,
+                  family="binomial",
+                  data = lrti_data.inla%>% mutate(ID2=ID),
+                  Ntrials = npatients, # N Bernouilli experiments 
+                  control.predictor = list(compute=T),
+                  control.compute=list(waic=T,dic=T,config=T))
+
+summary(inla.out14)
+sum14<-get_model_summary(inla.out14)
+
+
+################################################################################
+# COLLECT DIC WAIC.. FOR ALL MODELS
+
+models.out <- list(inla.out1,
+                  inla.out2,
+                  inla.out3,
+                  inla.out4,
+                  inla.out5,
+                  inla.out6,
+                  inla.out7,
+                  inla.out8,
+                  inla.out9,
+                  inla.out10,
+                  inla.out11,
+                  inla.out12,
+                  inla.out13,
+                  inla.out14)
+
+
+stats <- data.frame(matrix(NA,nrow=length(models.out),ncol=5))
+colnames(stats) <-c("Model","WAIC","DIC","MMLIK","Eff no par (WAIC)")
+
+i=0
+for (out in models.out) {
+  i=i+1
+  stats[i,1]<- paste0("Model ",i)
+  stats[i,2] <- out$waic$waic
+  stats[i,3] <- out$dic$dic
+  stats[i,4] <- out$misc$configs$max.log.posterior
+  stats[i,5] <- out$waic$p.eff
+  
+}
+
+
+
+
+
+################################################################################
+# PLOT SPATIAL RANDOM EFFECT 
+
+names(inla.out5$marginals.random)
+
+ID_est <- inla.out5$summary.random$ID
+ID2_est <- inla.out5$summary.random$ID2
+
+
+# Laod map as SF object 
+source("functions.R")
+
+map_sf.shp <- get_sf_map_flanders()
+
+map_sf.shp <- map_sf.shp %>% 
+  arrange(NISCODE)
+
+map_sf.shp$ID=1:nrow(map_sf.shp)
+
+map_random_sp <- map_sf.shp %>% 
+  left_join(ID_est,by="ID") %>% 
+  left_join(ID2_est,by="ID",suffix=c("","2"))
+
+
+u <- ggplot(data=map_random_sp) +
+  theme_void() +
+  geom_sf(aes(fill=exp(mean)))+
+  scale_fill_continuous("u: icar",type="viridis")
+v <- ggplot(data=map_random_sp) +
+  theme_void() +
+  geom_sf(aes(fill=exp(mean2)))+
+  scale_fill_continuous("v: extra",type="viridis")
+library(cowplot)
+sp_re <- plot_grid(u,v,nrow=2)
+sp_re
+ggsave("spatial_random_effects2.png",sp_re)
+
+
+## PLOT RANDOM EFFECTS model 6: BESAG + PRACTICE
+
+
+ID_est <- inla.out6$summary.random$ID
+pr_est <- inla.out6$summary.random$practice_id
+
+
+# Laod map as SF object 
+source("functions.R")
+
+map_sf.shp <- get_sf_map_flanders()
+
+map_sf.shp <- map_sf.shp %>% 
+  arrange(NISCODE)
+
+map_sf.shp$ID=1:nrow(map_sf.shp)
+
+map_random_sp <- map_sf.shp %>% 
+  left_join(ID_est,by="ID") 
+
+
+u <- ggplot(data=map_random_sp) +
+  theme_void() +
+  geom_sf(aes(fill=exp(mean)))+
+  scale_fill_continuous("u: icar",type="viridis")
+u
+
+view(inla.out6$summary.random$practice_id)
+
+practice_coordinates <- readRDS("./practice_location_data.rds")
+
+practice_re <- practice_coordinates %>% 
+  left_join(inla.out6$summary.random$practice_id,by=c("practice_id"="ID"))
+
+pr <- ggplot(data = map_sf.shp) +
+  theme_void() +
+  geom_sf(fill = 'gray', color = 'gray', alpha = .1) +
+  geom_point(data = practice_re, aes(x = lon, y = lat,size=abs(mean),colour=exp(mean)), alpha = 1)+
+  #ggtitle("Random effect practice")+
+  theme(legend.position = "right") + 
+  scale_colour_continuous("practice",type="viridis") + 
+  scale_size(guide='none')
+pr
+
+library(cowplot)
+sp_re <- plot_grid(u,pr,nrow=2)
+sp_re
+ggsave("spatial_and_practice_effect2.png",sp_re)
+
+
+
+
+
+
+
+

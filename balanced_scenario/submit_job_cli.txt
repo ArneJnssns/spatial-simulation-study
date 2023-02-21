@@ -1,0 +1,4 @@
+# submit the job as follows: 
+
+$ module load worker
+$ wsub -batch run.pbs -data parameters.txt -A lp_intego

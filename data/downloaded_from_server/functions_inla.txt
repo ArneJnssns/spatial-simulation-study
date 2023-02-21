@@ -1,0 +1,455 @@
+## Prepare individual patient data to use in binomial model with r-inla
+
+get_structured_data_binom <- function(patient_data, 
+                                      outcome,covariate_fixed,covariate_random,
+                                      post_to_nis_map,age_breaks,remove_nis,map,
+                                      predict = TRUE) {
+  
+  # patient_data = dataframe with individual patietn data
+  # outcome: define outcome variable(s)
+  # covariate_fixed/radnom: List of covariates as they are names in dataframe - fixed + random 
+  # pots_to_nis_map: Post to nis mapping 
+  # age_breaks: Defines age categories 
+  # remove_nis: Nis to remove because infered with model
+  # map: SpatialPolygon object of Flanders
+  # predict: indicate if data for predictions needs to be included 
+  
+  data_agg <- patient_data %>% 
+    # Filter gender and age 
+    filter((sex == "M" | sex == "F"), age %in% c(0:111)) %>% 
+    # Not in population data -> remove
+    filter(increased_compensation!="Unknown") %>% 
+    # Age categories as input parameter
+    mutate(age.category = cut(age, breaks = age_breaks)) %>% 
+    # Map postal code to nis (or ELZ or ...)
+    left_join(post_to_nis,by="postal_code") %>% 
+    # Select columns of interest 
+    select(all_of(c(outcome,covariate_fixed,covariate_random))) %>%
+    # Keep non-NA (mostly NA nis and practice)
+    drop_na() %>% 
+    # Filter out some nis as oana did? 
+    filter(!nis_code%in%remove_nis) %>% 
+    # Make sure no factor columns are present (for subset of practices; otherwise factor levels remain)
+    mutate_if(is.factor,as.character) %>% 
+    # Summrize to use in r-inla
+    group_by_at(vars(all_of(c(covariate_fixed,covariate_random)))) %>% 
+    summarize(
+      ncases = sum(across(all_of(outcome))),
+      npatients = n() 
+    ) %>% 
+    ungroup() 
+  
+  
+  if(predict){
+    
+    ## If data for predictions in needed
+    
+    # Load this data (preprepared)
+    pred_data <- readRDS("./data_for_prediction_se.rds")
+    
+    # Left join pop data
+    data_all <- data_agg %>% 
+      left_join(pred_data,
+                by=all_of(colnames(pred_data)[colnames(pred_data) %in%colnames(data_agg)]) ) %>% 
+      group_by(nis_code,sex,age.category,increased_compensation) %>% # This should be automated?
+      # Pop data split by practice in intego
+      mutate(ntot = sum(npatients),
+             npract_prop = npatients/ntot,
+             npatients_pract = npract_prop*n_patients) %>% 
+      select(-c("ntot","npract_prop","n_patients")) %>% 
+      ungroup() %>% 
+      # create factor for several variables
+      mutate(sex = factor(sex),
+             increased_compensation=factor(increased_compensation,levels=c("No","Yes")),
+             age.category = factor(age.category),
+             age.category = relevel(age.category,ref="(16,50]")) %>% 
+      # Order nis
+      arrange(nis_code)
+    
+    # Create the data to make predictions for
+    # ONE OPTION: DOUBLE DATA WITH NA values for nevent to obtain predictions
+    
+    doubledata <- rbind(
+      doubledataI <- data_all %>% 
+        select(-npatients_pract),
+      doubledataNA <- data_all %>% 
+        select(-npatients) %>% 
+        mutate(ncases=NA) %>% 
+        rename(npatients=npatients_pract)
+    )
+    
+    str(doubledata)
+    
+    ## Merge with SpatialPolygon
+    doubledata <- merge(doubledata,map@data, by.x="nis_code",by.y="NISCODE",all=T)
+    
+    ## sort data according to the area, (month), se, age.category
+    doubledataNA <- doubledata %>% 
+      filter(is.na(ncases)) %>% 
+      arrange(nis_code,sex,age.category,increased_compensation,practice_id)
+    
+    doubledatanotNA <- doubledata %>% 
+      filter(!is.na(ncases)) %>% 
+      arrange(nis_code,sex,age.category,increased_compensation,practice_id)
+    
+    ## Final dataset
+    doubledata <- rbind(doubledataNA,doubledatanotNA)
+    
+    return(doubledata)
+    
+    
+  }else {
+    
+    data_all <- data_agg %>% 
+      # create factor for several variables
+      mutate(sex = factor(sex),
+             increased_compensation=factor(increased_compensation,levels=c("No","Yes")),
+             age.category = factor(age.category),
+             age.category = relevel(age.category,ref="(16,50]")) %>% 
+      # Order nis
+      arrange(nis_code)
+    
+    data_all <- merge(data_all,map@data, by.x="nis_code",by.y="NISCODE",all=T)
+    
+    
+    
+  }
+  
+  
+}
+
+#-----------------#-----------------#-----------------#-----------------#-------
+
+
+## Get the fixed effect estimates as exp(beta) (for binom = odds)
+get_fixed_effects_inla <- function(fit_out,OR=TRUE){
+  
+  marginals <- data.frame(matrix(NA,nrow=length(fit_out$marginals.fixed),ncol=5))
+  marginals[,1] <-names(fit_out$marginals.fixed)
+  
+  for (i in 1:length(fit_out$marginals.fixed)){
+    
+    if(OR){
+      m_or <-inla.tmarginal(fun=function(x) exp(x), fit_out$marginals.fixed[[i]])
+      
+    }else{
+      m_or <-fit_out$marginals.fixed[[i]]
+      
+    }
+
+    est <- inla.zmarginal(m_or,silent=TRUE)
+    marginals[i,2] <- est$mean
+    marginals[i,3] <- est$sd
+    
+    # summary marginal distribution: HPD interval
+    hpd <- inla.hpdmarginal(.95,marginal=m_or)
+    marginals[i,4] <- hpd[,1]
+    marginals[i,5] <- hpd[,2]
+    
+  }
+  
+  names(marginals) = c("param","mean","sd","lower","upper")
+  return(marginals)
+}
+
+#-----------------#-----------------#-----------------#-----------------#-------
+
+## Get Random effects (exp(effect))
+get_random_effects_inla <- function(inla.model,OR=TRUE,nis_ids=NULL){
+  
+  # Binomial model -> odd ratios
+  
+  # empty list 
+  re_estimates <- list()
+  
+  for(re in names(inla.model$marginals.random)){
+    
+    
+    marginals_re <- data.frame(matrix(NA,nrow=length(inla.model$marginals.random[[re]]),ncol=5))
+    marginals_re[,1] <-c(names(inla.model$marginals.random[[re]]))
+    
+    for (i in 1:length(inla.model$marginals.random[[re]])){
+      
+      if(OR){
+        marg <-inla.tmarginal(fun=function(x) exp(x), inla.model$marginals.random[[re]][[i]])
+        
+      }else{
+        marg <-inla.model$marginals.random[[re]][[i]]
+        
+      }
+      
+      est <- inla.zmarginal(marg,silent=T)
+      marginals_re[i,2] <- est$mean
+      marginals_re[i,3] <- est$sd
+      
+      # 95% CI (HPD interval)
+      hpd <- inla.hpdmarginal(.95,marginal=marg)
+      marginals_re[i,4] <- hpd[,1]
+      marginals_re[i,5] <- hpd[,2]
+      
+    }
+    
+    # Set col names
+    names(marginals_re) = c("ID","mean","sd","lower","upper")
+    
+    if(re=="practice_id"){
+      
+      marginals_re <- marginals_re %>% 
+        mutate(ID=inla.model$summary.random$practice_id$ID)
+      
+      
+    } else {
+      
+      if(is.null(nis_ids)){
+        
+        marginals_re <- marginals_re %>%
+          mutate(ID=inla.model$summary.random[[re]]$ID)
+        
+      } else 
+        
+        marginals_re <- marginals_re %>%
+          mutate(ID=inla.model$summary.random[[re]]$ID) %>% 
+          left_join(nis_ids,by="ID") %>% 
+          mutate(province = case_when(
+            substr(nis_code,1,1)==1 ~ "Antwerpen",
+            substr(nis_code,1,1)==2 ~ "Vlaams-Brabant",
+            substr(nis_code,1,1)==3 ~ "West-Vlaanderen",
+            substr(nis_code,1,1)==4 ~ "Oost-Vlaanderen",
+            TRUE ~ "Limburg")
+          ) %>% 
+          mutate(province=factor(province,levels=c("West-Vlaanderen","Oost-Vlaanderen",
+                                                   "Vlaams-Brabant","Antwerpen",
+                                                   "Limburg")))
+    }
+    
+    # Append to re_estimates list
+    re_estimates <- append(re_estimates,list(marginals_re))
+  }
+  
+  
+  names(re_estimates)=names(inla.model$marginals.random)
+  return(re_estimates)
+  
+}
+#-----------------#-----------------#-----------------#-----------------#-------
+
+
+## Get Goodness of Fit statistics
+get_goodness_of_fit_inla <- function(fit_out,model_name=""){
+  
+  goodness_of_fit <- data.frame(matrix(NA,1,ncol=5))
+  colnames(goodness_of_fit) <-c("Model","WAIC","DIC","MMLIK","Eff no par (WAIC)")
+  
+  goodness_of_fit[1,1]<- model_name
+  goodness_of_fit[1,2] <- fit_out$waic$waic
+  goodness_of_fit[1,3] <- fit_out$dic$dic
+  goodness_of_fit[1,4] <- fit_out$misc$configs$max.log.posterior
+  goodness_of_fit[1,5] <- fit_out$waic$p.eff
+  
+  return(goodness_of_fit)
+}
+#-----------------#-----------------#-----------------#-----------------#-------
+
+
+## Function to plot fixed effects 
+plot_fixed_effects <- function(fe_estimates,OR=TRUE){
+  
+  if(OR){
+    x_intercept=1
+  }else{
+    x_intercept=0
+  }
+  
+  if("model"%in%colnames(fe_estimates)){
+    
+    ggplot(data=fe_estimates,aes(y=param,x=mean,color=model,shape=model,linetype=model))+ geom_point()+
+      geom_errorbar(aes(xmin = lower, xmax = upper),width=0,size=1)+
+      geom_vline(xintercept=x_intercept)+
+      labs(x="Odds ratio",title="Fixed effects estimates")+
+      scale_linetype_manual(values=c("solid","dashed","11"))+
+      scale_x_continuous(breaks=seq(round(min(fe_estimates$mean),0),round(max(fe_estimates$mean),0),0.5))+
+      theme(legend.position = "bottom")
+  } else {
+    
+    ggplot(data=fe_estimates,aes(y=param,x=mean))+ 
+      geom_point()+
+      geom_errorbar(aes(xmin = lower, xmax = upper),width=0,size=1)+
+      geom_vline(xintercept=x_intercept)+
+      labs(x="Odds ratio",title="Fixed effects estimates")+
+      scale_linetype_manual(values=c("solid","dashed","11"))+
+      scale_x_continuous(breaks=seq(round(min(fe_estimates$mean),0),round(max(fe_estimates$mean),0),0.5))+
+      theme(legend.position = "bottom")
+    
+  }
+}
+#-----------------#-----------------#-----------------#-----------------#-------
+
+
+
+## Function to plot random effect 
+plot_random_effects <- function(re_estimates,n_re=2,map=TRUE){
+  
+  if(map){
+    
+    # Load map as SF object 
+    source("Z:/Projects_Arne/Simulation_Spatial/Code/functions_geo.R")
+    map_sf.shp <- get_sf_map_flanders()
+    map_sf.shp <- map_sf.shp %>% 
+      arrange(NISCODE)
+    map_sf.shp$ID=1:nrow(map_sf.shp)
+    
+    pre<-list()
+    
+    for(re in names(re_estimates)[1:n_re]){
+      
+      if(re == "practice_id"){
+        
+        # load pracitce locations 
+        practice_coordinates <- readRDS("./practice_location_data.rds")
+        practice_re <- practice_coordinates %>% 
+          left_join(re_estimates$practice_id,by=c("practice_id"="ID"))
+        
+        
+        pre[[re]] <- ggplot(data = map_sf.shp) +
+          theme_void() +
+          geom_sf(fill = 'gray', color = 'gray', alpha = .1) +
+          geom_point(data = practice_re, aes(x = lon.pc_mean, y = lat.pc_mean,size=mean,colour=mean), alpha = 1)+
+          theme(legend.position = "right") + 
+          scale_colour_continuous("Practice",type="viridis") + 
+          scale_size(guide='none')#+
+        # labs(title="Practice Random Effect (Odds ratio)")
+        
+        
+        
+      }else if(re=="ID") {
+        
+        pre[[re]] <- ggplot(data = map_sf.shp %>% left_join(re_estimates[[re]],by="ID"))+
+          theme_void()+
+          geom_sf(aes(fill=mean))+
+          scale_fill_continuous("Spatially Structured",type="viridis")#+
+        #labs(title="Community Random Effect (Odds ratio)")
+      }else{
+        
+        pre[[re]] <- ggplot(data = map_sf.shp %>% left_join(re_estimates[[re]],by="ID"))+
+          theme_void()+
+          geom_sf(aes(fill=mean))+
+          scale_fill_continuous("Spatially Unstructured",type="viridis")#+
+        #labs(title="Community Random Effect (Odds ratio)")
+        
+        
+      }
+      
+      # library(gridExtra)
+      library(cowplot)
+      plots_re<-plot_grid(plotlist = pre,ncol=1,align="hv",axis="r")
+      
+    }
+    
+  } else {
+    
+    plots <-list()
+    
+    for(re in names(re_estimates)[1:n_re]){
+      
+      if(re=="practice_id"){
+        
+        plots[[re]] <- ggplot(data=re_estimates[[re]] %>% mutate(ID = as.numeric(factor(ID)))) +
+          geom_line(aes(x=ID,y=mean))+
+          geom_ribbon(aes(x=ID,ymin=lower,ymax=upper),alpha=0.2,linetype=2)+
+          labs(title=paste0("Random Effect: ",re))
+        
+      } else {
+        
+        if("province" %in% colnames(re_estimates[[re]])){
+          
+          plots[[re]] <- ggplot(data=re_estimates[[re]] %>% 
+                                  arrange(province,nis_code) %>% 
+                                  mutate(ID = 1:nrow(re_estimates[[re]]))) +
+            geom_point(aes(x=ID,y=mean,colour=province))+
+            geom_errorbar(aes(x=ID,ymin=lower,ymax=upper,colour=province),alpha=0.2,linetype=2)+
+            labs(title=paste0("Random Effect: ",re))
+          
+        }else{
+          plots[[re]] <- ggplot(data=re_estimates[[re]]) +
+            geom_line(aes(x=ID,y=mean))+
+            geom_ribbon(aes(x=ID,ymin=lower,ymax=upper),alpha=0.2,linetype=2)+
+            labs(title=paste0("Random Effect: ",re))
+        }
+      }
+    }
+    
+    library(gridExtra)
+    plots_re<-do.call(grid.arrange,plots)
+    
+  }
+  
+  return(plots_re)
+}
+#-----------------#-----------------#-----------------#-----------------#-------
+
+
+## Get Predicted number of cases from binom moel
+get_predicted_incidence_inla <- function(inla_model,model_data){
+  
+  # PREDICTIONS
+  predicted.values.mean <- c()
+  predicted.values.std <- c()
+  for(i in 1:length(inla_model$marginals.fitted.values)){
+    predicted.values.mean[i] <- 
+      inla.emarginal(function(x) x*model_data$npatients[i],
+                     inla_model$marginals.fitted.values[[i]])
+    
+    # predicted.values.std[i]<-
+    #   inla.zmarginal(model_data$npatients[i]*
+    #                    inla_model$marginals.fitted.values[[i]],silent=T)[[2]]
+    
+  }
+  
+  model_data$fitted.values <- round(predicted.values.mean, digits=3)
+  # model_data$fitted.values.std <- round(predicted.values.std, digits=3)
+  data_fit <- model_data[is.na(model_data$ncases),]
+  
+  #RR.mean represents the predicted number of cases in that area
+  data_fit <- data_fit %>% 
+    group_by(nis_code) %>% 
+    summarise(RR.mean=sum(fitted.values),Totpop=sum(npatients))
+  
+  #incidence in a population of 100,000 inhabitants
+  data_fit$pred <- (data_fit$RR.mean/data_fit$Totpop)*100000
+  
+  return(data_fit)
+  
+}
+#-----------------#-----------------#-----------------#-----------------#-------
+
+
+
+# from utils.R
+Fisher_bin <- function(x, num_bin = 5) {
+  require(classInt)
+  class <- classIntervals(x[!is.na(x)], num_bin, style = 'fisher')
+  ret <- cut(x, breaks = class$brks, right = FALSE, include.lowest = TRUE, dig.lab = 6)
+  return(ret)
+}
+
+
+## Plot predicted incidence
+plot_predicted_incidence <- function(predictions_inla,nclr=8){
+  
+  plot_breaks <- Fisher_bin(predictions_inla$pred,nclr)
+  predictions_inla$incidence <- plot_breaks
+  plotclr <- rev(brewer.pal(nclr,"RdYlGn"))
+  
+  source("Z:/Projects_Arne/Simulation_Spatial/Code/functions_geo.R")
+  map_sf.shp <- get_sf_map_flanders()
+  map_sf.shp <- map_sf.shp %>% 
+    arrange(NISCODE)
+  
+  ggplot(data = map_sf.shp %>% 
+           left_join(predictions_inla,by=c("NISCODE"="nis_code")))+
+    theme_void()+
+    geom_sf(aes(fill=incidence))+
+    scale_fill_manual("LRTI cases in 100.000 inhabitants",values=plotclr)
+  
+}
+#-----------------#-----------------#-----------------#-----------------#-------

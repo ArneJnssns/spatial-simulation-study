@@ -1,0 +1,855 @@
+# Simulation with estimated parameters 
+# - fixed effect 
+# - nis effect 
+# - practie effect 
+
+# Keep all fixed and simuilate 100 datasets 
+
+rm(list=ls())
+
+# Libraries
+library(tidyverse)
+library(lubridate)
+
+library(INLA)
+library(rgdal)
+library(spdep)
+
+library(RColorBrewer)
+library(classInt)
+
+# Setwd
+setwd("Z:/Projects_Arne/Simulation_Spatial")
+
+# Avoid scientific notation
+options(scipen=999)
+
+# Functions 
+source("./Code/functions_geo.R")
+source("./Code/functions_inla.R")
+
+
+## DATA 
+
+lrti_data <- readRDS("./Data/lrti_data_2019.rds")
+map.shp <- readOGR("Z:/Intego_Data/Spatial_Data/Shape_Files/Flanders_2019/Refgem.shx")
+
+# Order ,nis 
+map.shp <- map.shp[order(map.shp@data$NISCODE),] 
+
+# RANDOM EFFECTS for each area
+map.shp@data$ID <- 1:nrow(map.shp@data)
+
+# ID MAPPING 
+nis_id <- map.shp@data %>% select(nis_code = NISCODE,name=NAAM,ID)
+
+# neighbors list  
+map.nb <- poly2nb(map.shp,row.names=map.shp@data$ID,queen=T)
+
+# Convert the adjency matrix into a file in the INLA format
+nb2INLA(map.nb,file="map.gra")
+
+## Structure dat to fit binomial model 
+# inputs
+outcome <- c("event")
+covariate_fixed <- c("sex","age.category","increased_compensation")
+covariate_random <- c("practice_id","nis_code")
+post_to_nis <- get_post_to_nis_mapping()
+age_breaks <- c(-1,5,16,50,65,85,110) 
+remove_nis<- c()
+
+# Structured data
+inla.data <- get_structured_data_binom(lrti_data,outcome,covariate_fixed,covariate_random,
+                                       post_to_nis,age_breaks,remove_nis,map.shp,
+                                       predict=FALSE)
+
+# Save for download 
+write.csv(inla.data,"./Download/inla.data.csv")
+
+
+# # Model 
+# formula <- ncases ~ sex + age.category + increased_compensation  + 
+#   f(ID, model="besag",graph="map.gra",scale.model=T) + # ICAR
+#   f(practice_id, model="iid")
+# 
+# 
+# #Binomial
+# inla.binom <- inla(formula,
+#                    family="binomial",
+#                    data = inla.data,
+#                    Ntrials = npatients # N Bernouilli experiments
+#                    # Only interested to extract estimates now
+#                    # control.predictor = list(link=T),
+#                    # control.compute=list(waic=T,dic=T,config=T)
+# )
+# 
+# # Plots and maps of estimates
+# fe.binom <- get_fixed_effects_inla(inla.binom)
+# pl.binom <- plot_fixed_effects(fe.binom)
+# pl.binom
+# re.binom <- get_random_effects_inla(inla.binom)
+# pl_re.binom<-plot_random_effects(re.binom)
+# pl_re.binom
+# 
+# # Save point estimates of parameters -> use in simulation fixed
+# point_estimates <- rbind(
+#   inla.binom$summary.fixed %>% rownames_to_column(var="parameter") %>%
+#     # Rename to be consistent with inla.data
+#     mutate(parameter = c("intercept","M","(-1,5]","(5,16]","(50,65]","(65,85]","(85,110]","Yes")) %>%
+#     # Add reference ceategories
+#     add_row(parameter = c("F","(16,50]","No"),
+#             mean = c(0,0,0)),
+#   inla.binom$summary.random$ID %>% rename(parameter=ID),
+#   inla.binom$summary.random$practice %>% rename(parameter=ID)
+# )
+# 
+# saveRDS(point_estimates,"./Code/binom_point_estimates.rds")
+
+
+#--------------- SIMULATION ---------------------------------------------------#
+
+## Read point estoimates 
+estimates <- readRDS("./Code/binom_point_estimates.rds") %>% 
+  column_to_rownames(var="parameter")
+
+## Plots 
+map_sf.shp <- st_as_sf(map.shp) 
+plot(st_geometry(map_sf.shp))
+str(map_sf.shp)
+
+# icar effect
+icar <- estimates %>% 
+  rownames_to_column(var="ID") %>% 
+  filter(ID %in% c(1:300)) %>% 
+  mutate(ID=as.integer(ID)) 
+
+ggplot(data = map_sf.shp %>% 
+         left_join(icar,by="ID")) +
+  theme_void()+
+  geom_sf(aes(fill=exp(mean),colour=exp(mean)>1))+
+  scale_fill_viridis_c("icar")+
+  scale_color_manual(">1",values=alpha(c("TRUE"="red","FALSE"="grey"),0.4))
+
+# practice
+re_practice <- estimates %>% 
+  rownames_to_column(var="practice_id") %>% 
+  slice(312:416)
+
+re_practice <- readRDS("./practice_location_data.rds") %>% 
+  left_join(re_practice,by="practice_id")
+
+ggplot(data = map_sf.shp) +
+  theme_void()+
+  geom_sf(fill="grey90",alpha=0.2)+
+  geom_point(data=re_practice,alpha=0.8,
+             aes(x=lon.pc_mean,y=lat.pc_mean,size=exp(mean),fill=exp(mean),colour=mean>0,shape=mean>0))+
+  scale_fill_viridis_c("practice")+
+  scale_size(guide="none")+
+  scale_color_manual(">1",values=alpha(c("TRUE"="red","FALSE"="grey"),0.8))+
+  scale_shape_manual(">1",values=c("TRUE"=21,"FALSE"=24))
+
+
+
+
+# identical(estimates,point_estimates)
+
+
+inla.sim <- inla.data %>% 
+  select(nis_code,ID,sex,age.category,increased_compensation,practice_id,ncases,npatients) %>% 
+  # Change to characters
+  mutate_if(is.factor,as.character) %>% 
+  mutate(ID=as.character(ID)) %>% 
+  # Compute linear predictor
+  mutate(sim_alpha_binom = estimates["intercept",]$mean+
+           estimates[ID,]$mean+
+           estimates[sex,]$mean+
+           estimates[age.category,]$mean+
+           estimates[increased_compensation,]$mean+
+           estimates[practice_id,]$mean,
+         sim_prob_binom = exp(sim_alpha_binom)/(1+exp(sim_alpha_binom))) %>% 
+  # Make factors for analysis 
+  mutate(age.category=factor(age.category,
+                             levels=c("(16,50]","(-1,5]","(5,16]","(50,65]","(65,85]","(85,110]")))
+
+probs <- inla.sim$sim_prob_binom  
+npats <- inla.sim$npatients
+
+nsim=100
+sim_ncases <- matrix(nrow=length(probs),ncol=nsim)
+for(j in 1:nsim){
+  set.seed(j) # Should be here (check simulation_double_check.R)
+  for(i in 1:length(probs)){
+    sim_ncases[i,j] <- rbinom(n=1,size=npats[i],prob=probs[i])
+  }
+}
+
+plot(sim_ncases[,1],sim_ncases[,100])
+hist(sim_ncases)
+
+
+# plot(sim_ncases[,1],inla.data$ncases)+abline(a=0,b=1)
+# # points(sim_ncases[,3],inla.data$ncases)
+# 
+#  for(i in 2:100){
+#    points(sim_ncases[,i],inla.data$ncases)
+# 
+#  }
+
+# Simul
+
+# Need for confidence intervals -> HPD (credible interval of estimates)
+# - now only for odds ratio level estimates, can do the same for log-odds estimates if necessary? 
+# - CI computed from marginal dsitributions using inla functions 
+
+# nsim<-100
+# # fe <- matrix(nrow = 8,ncol=nsim)
+# # re_nis <- matrix(nrow=300,ncol=nsim)
+# # re_practice <- matrix(nrow=105,ncol=nsim)
+# fe_odds <- array(dim=c(8,nsim,4),dimnames = list(NULL,NULL,c("mean","sd","lower","upper")))
+# re_nis_odds <- array(dim=c(300,nsim,4),dimnames = list(NULL,NULL,c("mean","sd","lower","upper")))
+# re_practice_odds <- array(dim=c(105,nsim,4),dimnames = list(NULL,NULL,c("mean","sd","lower","upper")))
+# formula <- ncases ~ sex + age.category + increased_compensation  +
+#     f(ID, model="besag",graph="map.gra",scale.model=T) + # ICAR
+#     f(practice_id, model="iid")
+# start <- Sys.time()
+# for(n in 1:nsim){
+# 
+#   data.sim <- inla.data %>% mutate(ncases=sim_ncases[,n])
+# 
+#   inla.out <- inla(formula,
+#                    family="binomial",
+#                    data = data.sim,
+#                    Ntrials = npatients # N Bernouilli experiments
+#                    # control.predictor = list(link=T),
+#                    # control.compute=list(waic=T,dic=T,config=T)
+#   )
+#   
+#   fe_out <- get_fixed_effects_inla(inla.out)
+#   re_out <- get_random_effects_inla(inla.out)
+# 
+# #   fe[,,n] <- inla.out$summary.fixed[,1:5]
+# #   re_nis[,,n] <- inla.out$summary.random$ID[,2:6]
+# #   re_practice[,,n] <- inla.out$summary.random$practice_id[,2:6]
+#   
+#   
+#   fe_odds[,n,"mean"] <- as.matrix(fe_out[,2])
+#   fe_odds[,n,"sd"] <- as.matrix(fe_out[,3])
+#   fe_odds[,n,"lower"] <- as.matrix(fe_out[,4])
+#   fe_odds[,n,"upper"] <- as.matrix(fe_out[,5])
+#   
+#   re_nis_odds[,n,"mean"] <- as.matrix(re_out$ID[,2])
+#   re_nis_odds[,n,"sd"] <- as.matrix(re_out$ID[,3])
+#   re_nis_odds[,n,"lower"] <- as.matrix(re_out$ID[,4])
+#   re_nis_odds[,n,"upper"] <- as.matrix(re_out$ID[,5])
+#   
+#   re_practice_odds[,n,"mean"] <- as.matrix(re_out$practice[,2])
+#   re_practice_odds[,n,"sd"] <- as.matrix(re_out$practice[,3])
+#   re_practice_odds[,n,"lower"] <- as.matrix(re_out$practice[,4])
+#   re_practice_odds[,n,"upper"] <- as.matrix(re_out$practice[,5])
+#   
+# 
+# }
+# end <- Sys.time()
+# end-start
+# 
+# plot(re_nis_odds[,,"mean"],re_nis_odds[,,"sd"])
+
+# # put in list
+# # simulation_fixed <- list(fe = fe,nis=re_nis,practice=re_practice)
+# simulation_fixed_odds <- list(fe = fe_odds,nis=re_nis_odds,practice=re_practice_odds)
+# 
+# # Save results 
+# # saveRDS(simulation_fixed,"./Code/fixed_simulation_estimates.rds")
+# saveRDS(simulation_fixed_odds,"./Code/fixed_simulation_estimates_odds.rds")
+
+
+
+## ANALYSIS  ##
+
+# 
+sim_est <- readRDS("./Code/fixed_simulation_estimates.rds")
+# Per simulation: mean, sd, lower, upper CI
+sim_est_odds <- readRDS("./Code/fixed_simulation_estimates_odds.rds")
+
+
+## Fixed effect 
+
+# Simulated
+
+make_longer <- function(array_oi,matrix="mean"){
+  return(as.vector(t(array_oi[,,matrix])))
+}
+
+meas <- c("mean","sd","lower","upper")
+fe_sim <- matrix(nrow=800,ncol=4,dimnames=list(NULL,meas))
+for(m in c("mean","sd","lower","upper")){
+  fe_sim[,m]<-make_longer(sim_est_odds$fe,m)  
+}
+
+parameters <- rownames(estimates %>% slice(1:8))
+fe_sim <- cbind.data.frame(fe_sim,"index"=rep(1:100,8),"parameter"=rep(parameters,each=100))
+
+fe_var <- as_tibble(fe_sim) %>% 
+  left_join(estimates %>% 
+              slice(1:8) %>% 
+              select(mean) %>% 
+              rownames_to_column(var="parameter"),by="parameter",suffix=c(".out",".in")) %>% 
+  mutate(mean.in = exp(mean.in),
+         in_ci = ifelse(mean.in <= upper & mean.in >= lower,"1","0"))
+
+
+
+# Odds ratios boxplot
+ggplot(data=fe_var,aes(x=index,y=mean.out,group=parameter))+
+  geom_boxplot(alpha=0.8)+
+  geom_point(aes(color=in_ci))+
+  geom_line(aes(x=index,y=mean.in),color="red",size=1.2)+
+  geom_hline(yintercept = 1)+
+  # geom_errorbar(aes(ymin=lower,ymax=upper))+
+  facet_grid(cols=vars(parameter),scales="free")+
+  theme(axis.text.x = element_blank())+
+  labs(x="Simulation",y="Estimate")+
+  scale_color_manual(values=c("1"="black","0"="red"))
+
+# Odds ratios CIs 
+ggplot(data=fe_var,aes(x=index,y=mean.out,group=parameter))+
+  theme_bw()+
+  geom_point(aes(color=in_ci))+
+  geom_errorbar(aes(ymin=lower,ymax=upper),color="grey20")+
+  geom_line(aes(x=index,y=mean.in),color="black",size=1,alpha=0.6)+
+  facet_grid(vars(parameter),scales="free")+
+  # theme(axis.text.x = element_blank())+
+  labs(x="Simulation",y="Estimate")+
+  scale_color_manual(values=c("1"="grey20","0"="red"))
+
+ggplot(data=fe_var,aes(x=index,y=sd,group=parameter))+
+  theme_bw()+
+  geom_point()+
+  facet_grid(vars(parameter),scales="free")+
+  # theme(axis.text.x = element_blank())+
+  labs(x="Simulation",y="Estimate")
+
+
+
+## ICAR effect 
+
+library(matrixStats)
+?rowVars
+?rowSds
+
+# par(mfrow=c(1,2))
+plot(icar$mean,icar$sd,main="sd vs mean of input")
+plot(rowMeans(sim_est$nis),rowSds(sim_est$nis),main="sd vs mean of output")
+# dev.off()
+plot(icar$mean,rowMeans(sim_est$nis))
+plot(icar$sd,rowSds(sim_est$nis))
+
+
+nis_var=cbind(icar %>% select(ID,mean),sim_est$nis) %>% 
+  pivot_longer(cols=c(-"ID",-"mean"),names_to = "index",values_to = "estimate") %>% 
+  rename(parameter=ID) %>% 
+  mutate(dev = estimate-mean,
+         dev_exp = exp(estimate)-exp(mean))
+
+# Variance
+ggplot(data=nis_var %>% slice(1:10000),aes(x=as.integer(parameter),y=exp(mean),group=parameter))+
+  geom_boxplot(aes(y=exp(estimate)))+
+  # geom_point(color="red")+
+  labs(x="Community",y="Odds ratio")
+
+# Mean OR over 100 simulations
+mean_est <- nis_var %>% 
+  group_by(parameter) %>% 
+  summarize(icar=mean(exp(estimate)))
+# Map of mean OR
+ggplot(data=map_sf.shp %>% left_join(mean_est,by=c("ID"="parameter")))+
+  theme_void()+
+  geom_sf(aes(fill=icar))+
+  labs(title="Average over 100 simulations")+
+  scale_fill_viridis_c("OR(icar)")
+
+## ORs + CI 
+re_nis_sim <- matrix(nrow=300*100,ncol=4,dimnames=list(NULL,meas))
+for(m in c("mean","sd","lower","upper")){
+  re_nis_sim[,m]<-make_longer(sim_est_odds$nis,m)  
+}
+
+parameters <- rownames(estimates %>% slice(12:311))
+re_nis_sim <- cbind.data.frame(re_nis_sim,"index"=rep(1:100,300),"parameter"=rep(parameters,each=100))
+
+re_nis_var <- as_tibble(re_nis_sim) %>% 
+  left_join(estimates %>% 
+              slice(12:311) %>% 
+              select(mean) %>% 
+              rownames_to_column(var="parameter"),by="parameter",suffix=c(".out",".in")) %>% 
+  mutate(mean.in = exp(mean.in),
+         in_ci = ifelse(mean.in <= upper & mean.in >= lower,"1","0"))
+
+plot(re_nis_sim$mean,re_nis_sim$sd,main="OR(icar): sd vs mean",xlab="mean",ylab="sd")
+plot(re_nis_var$mean.out,re_nis_var$mean.in)
+
+re_nis_var_mean <- re_nis_var %>% 
+  group_by(parameter) %>% 
+  summarize(icar_m = mean(mean.out),
+            icar_sd = mean(sd)) %>% 
+  mutate(parameter=as.integer(parameter))
+ggplot(data=map_sf.shp %>% left_join(re_nis_var_mean,by=c("ID"="parameter")))+
+  theme_void()+
+  geom_sf(aes(fill=icar_sd))+
+  labs(title="Average sd 100 simulations")+
+  scale_fill_viridis_c("SD")
+
+# In confidence interval?
+re_nis_ci <- re_nis_var %>% 
+  group_by(parameter) %>% 
+  summarize(in_ci =  sum(in_ci=="1")) %>% 
+  mutate(parameter=as.integer(parameter))
+
+ggplot(data=map_sf.shp %>% left_join(re_nis_ci,by=c("ID"="parameter")))+
+  theme_void()+
+  geom_sf(aes(fill=in_ci))+
+  scale_fill_viridis_c()
+
+
+## Practice ##
+
+# plot sd and mean
+plot(rowMeans(exp(sim_est$practice)),rowSds(exp(sim_est$practice)),main="sd vs mean of output",
+     xlab="mean",ylab="sd")
+
+practice_var <- estimates %>% 
+  slice(312:416) %>% 
+  select(mean) %>% 
+  rownames_to_column(var="parameter")
+practice_var=cbind(practice_var,sim_est$practice) %>% 
+  pivot_longer(cols=c(-"parameter",-"mean"),names_to = "index",values_to = "estimate") %>% 
+  mutate(dev = estimate-mean,
+         dev_exp = exp(estimate)-exp(mean))
+
+# Varaince estimates
+ggplot(data=practice_var,aes(x=parameter,y=exp(mean),group=parameter))+
+  geom_boxplot(aes(y=exp(estimate)))+
+  geom_point(color="red")+
+  theme(axis.text.x = element_blank())+
+  labs(x="Practice",y="Odds Ratio")
+
+re_practice_sim <- matrix(nrow=105*100,ncol=4,dimnames=list(NULL,meas))
+for(m in c("mean","sd","lower","upper")){
+  re_practice_sim[,m]<-make_longer(sim_est_odds$practice,m)  
+}
+
+parameters <- rownames(estimates %>% slice(312:416))
+re_practice_sim <- cbind.data.frame(re_practice_sim,"index"=rep(1:100,105),"parameter"=rep(parameters,each=100))
+
+re_practice_var <- as_tibble(re_practice_sim) %>% 
+  left_join(estimates %>% 
+              slice(312:416) %>% 
+              select(mean) %>% 
+              rownames_to_column(var="parameter"),by="parameter",suffix=c(".out",".in")) %>% 
+  mutate(mean.in = exp(mean.in),
+         in_ci = ifelse(mean.in <= upper & mean.in >= lower,"1","0"))
+
+ggplot(re_practice_var,aes(x=parameter,color=in_ci))+
+  theme_bw()+
+  # geom_boxplot(out)
+  geom_jitter(aes(y=mean.out))+
+  geom_point(aes(y=mean.in,color="input"))+
+  theme(axis.text.x = element_blank())+
+  scale_color_manual("Estimates",
+                     labels=c("0"="Not in CI","1"="","input"="Input"),values=c("1"="black","0"="red","input"="blue"))+
+  labs(x="Practice",y="OR(practice)")
+
+# sd vs mean
+plot(re_practice_sim$mean,re_practice_sim$sd,main="OR(practice): sd vs mean",xlab="mean",ylab="sd")
+# sd vs man ggplot
+ggplot(re_practice_var,aes(x=mean.out,y=sd))+
+  theme_bw()+
+  geom_point(aes(color=parameter))+
+  scale_color_discrete(guide="none")+
+  labs(x="mean",y="sd",title="OR(practice)")
+ggplot(re_practice_var %>% group_by(parameter) %>% mutate(mean.out_mean=mean(mean.out),
+                                                          sd_mean = mean(sd)) %>% 
+         filter(mean.out_mean<2,sd_mean>0.2),
+       aes(x=mean.out,y=sd))+
+  theme_bw()+
+  geom_point(aes(color=parameter))+
+  scale_color_discrete(guide="none")
+ggplot(data=re_practice %>% left_join(re_practice_ci,by=c("practice_id"="parameter")) %>% 
+         filter(av_mean.out<2,av_sd>0.2))+
+  theme_void()+
+  geom_sf(data=map_sf.shp,fill=NA)+
+  # geom_point(aes(x=lon.pc_mean,lat.pc_mean,fill=av_mean.out<2),pch=21,alpha=0.8)+
+  geom_point(aes(x=lon.pc_mean,lat.pc_mean,color=av_sd),size=4,alpha=0.8)+
+  scale_color_viridis_c()+
+  # scale_fill_viridis_c()+
+  # theme(legend.position="bottom")+
+  labs(title="sd>0.2; mean<2")
+
+ggplot(re_practice_var,aes(x=mean.in,y=mean.out))+
+  geom_point()+
+  stat_smooth(formula=y~x,method="lm")
+
+re_practice_mean <- re_practice_var %>% 
+  group_by(parameter) %>% 
+  summarize(mean_ef = mean(mean.out))
+
+ggplot(data=map_sf.shp %>% left_join(mean_est,by=c("ID"="parameter")))+
+  theme_void()+
+  geom_sf(aes(fill=icar))+
+  geom_point(data=re_practice %>% left_join(re_practice_mean,by=c("practice_id"="parameter")),
+             aes(x=lon.pc_mean,y=lat.pc_mean,size=mean_ef,color=mean_ef))+
+  scale_size(guide="none")+
+  scale_fill_viridis_c("OR(icar)",guide="none")+
+  scale_color_viridis_c(option="magma")+
+  theme(legend.position="bottom")
+
+
+# In confidence interval?
+re_practice_ci <- re_practice_var %>% 
+  group_by(parameter) %>% 
+  summarize(in_ci =  sum(in_ci=="1"),
+            av_sd=mean(sd),
+            av_mean.out=mean(mean.out))
+
+ggplot(data=map_sf.shp)+
+  geom_sf(fill=NA)+
+  geom_point(data=re_practice %>% left_join(re_practice_ci,by=c("practice_id"="parameter")),
+             aes(x=lon.pc_mean,lat.pc_mean,color=in_ci),size=4,alpha=0.8)+
+  theme_void()+
+  scale_color_viridis_c()
+
+
+
+
+
+
+
+
+nis_var <- rowVars(sim_est$nis)
+nis_var_exp <- rowVars(exp(sim_est$nis))
+practice_var <- rowVars(sim_est$practice)
+practice_var_exp <- rowVars(exp(sim_est$practice))
+fe_var <- rowVars(sim_est$fe)
+fe_var_exp <- rowVars(exp(sim_est$fe))
+plot(fe_var)
+plot(fe_var_exp)
+
+## Diversity index for communities 
+
+div_matrix <- inla.data %>% 
+  group_by(ID,practice_id) %>% 
+  summarize(npatients = sum(npatients)) %>% 
+  group_by(ID) %>% 
+  arrange(practice_id) %>% 
+  pivot_wider(names_from = practice_id,values_from = npatients) %>% 
+  arrange(ID) %>% 
+  ungroup() %>%
+  select(-ID,-"NA") %>% 
+  as.matrix()
+
+div_matrix_ncases <- inla.data %>% 
+  group_by(ID,practice_id) %>% 
+  summarize(ncases = sum(ncases)) %>% 
+  group_by(ID) %>% 
+  arrange(practice_id) %>% 
+  pivot_wider(names_from = practice_id,values_from = ncases) %>% 
+  arrange(ID) %>% 
+  ungroup() %>%
+  select(-ID,-"NA") %>% 
+  as.matrix()
+
+an_matrix <- div_matrix
+# library(stats)
+heatmap(an_matrix,na.rm=T,Rowv=NA,Colv=NA)
+
+# Diversity index 
+nis_div <- rowSums(an_matrix^2,na.rm=T) / rowSums(an_matrix,na.rm=T)^2
+practice_div <- colSums(an_matrix^2,na.rm=T) / colSums(an_matrix,na.rm=T)^2
+
+# load pracitce locations 
+practice_coordinates <- readRDS("./practice_location_data.rds")
+practice_re <- practice_coordinates
+practice_re$diversity <- practice_div
+
+map_nis_div <- st_as_sf(map.shp) 
+map_nis_div$diversity <- nis_div
+library(scales)
+ggplot() +
+  theme_void() +
+  geom_sf(data=map_nis_div,aes(fill=diversity),alpha=0.8)+
+  geom_sf(data=map_sf.shp, color = 'gray', alpha = .1) +
+  geom_point(data = practice_re,pch=21, alpha = 0.6,color="black",
+             aes(x = lon.pc_mean, y = lat.pc_mean, 
+                 size=diversity, fill=diversity))+
+  theme(legend.position = "right") + 
+  scale_fill_viridis_c("Diversity",begin=0,end=1) + 
+  scale_size(guide='none')
+
+# plot 
+plot(nis_div,sqrt(nis_var),xlab="Diversity index",
+     ylab="STDEV over 100 estimates",main="Community Estimate")
+plot(nis_div,sqrt(nis_var_exp),xlab="Diversity index",
+     ylab="STDEV over 100 estimates",main="Community Odds")
+plot(practice_div,sqrt(practice_var),xlab="Diversity index",
+     ylab="STDEV over 100 estimates",main="Practice Estimate")
+plot(practice_div,sqrt(practice_var_exp),xlab="Diversity index",
+     ylab="STDEV over 100 estimates",main="Practice Odds")
+
+
+nis_div_var <- tibble(parameter=as.character(1:300),div=nis_div)
+nis_div_var<-re_nis_var %>% left_join(nis_div_var,by="parameter")
+ggplot(nis_div_var,aes(x=div,y=sd))+
+  geom_point()+
+  labs(title="Community",x="diversity index","sd")+
+  theme_bw()
+
+nis_pts <- inla.data %>% 
+  group_by(ID) %>% 
+  summarize(npatients=sum(npatients))
+
+nis_pts <- nis_pts %>% 
+  mutate(ID=as.character(ID)) %>% 
+  left_join(nis_div_var %>% 
+              group_by(parameter) %>% 
+              summarize(mean.out=mean(mean.out),
+                        sd=mean(sd),
+                        div=min(div)),by=c("ID"="parameter"))
+
+scatterplot3d(nis_pts$div,nis_pts$sd,nis_pts$npatients)
+plot(nis_pts$npatients,nis_pts$div)
+
+
+
+practice_div_var <- tibble(parameter=names(practice_div),div=practice_div)
+practice_div_var<-re_practice_var %>% left_join(practice_div_var,by="parameter")
+ggplot(practice_div_var,aes(x=div,y=sd))+
+  geom_point()+
+  labs(title="Practice",x="diversity index",y="sd")+
+  theme_bw()
+
+
+
+
+
+nis_est <- as_tibble(sim_est$nis) %>% rowid_to_column(var="ID")
+map_sf.shp <- map_sf.shp %>% 
+  left_join(nis_est,by="ID")
+
+map_sf.shp$var <- nis_var
+map_sf.shp$var_exp <- nis_var_exp
+
+ggplot() +
+  theme_void() +
+  geom_sf(data=map_sf.shp, color = "gray",aes(fill=exp(V1)<=1)) +
+  theme(legend.position = "right") + 
+  scale_fill_viridis_d("Estimate") 
+
+ggplot() +
+  theme_void() +
+  geom_sf(data=map_sf.shp, color = "gray",aes(fill=log(exp(V1)))) +
+  theme(legend.position = "right") + 
+  scale_fill_viridis_c("Odds Ratio") 
+
+ggplot() +
+  theme_void() +
+  geom_sf(data=map_sf.shp, color = "gray",aes(fill=sqrt(var_exp))) +
+  theme(legend.position = "right") + 
+  scale_fill_viridis_c("STD Odds") 
+
+map_sf.center <- st_centroid(map_sf.shp)
+ggplot() +
+  theme_void() +
+  geom_sf(data=map_nis_div,aes(fill=diversity),alpha=0.8)+
+  geom_sf(data=map_sf.center,aes(size=var,color=sqrt(var)),alpha=0.8) +
+  theme(legend.position = "right") + 
+  scale_fill_viridis_c("Diversity",begin=0,end=1) + 
+  scale_color_viridis_c("STDEV",option="magma")+
+  scale_size(guide='none')
+
+ggplot() +
+  theme_void() +
+  geom_sf(data=map_sf.shp,aes(fill=V1>=0), color = 'gray', alpha = .4) +
+  geom_point(data = practice_re, alpha = 0.6,
+             aes(x = lon.pc_mean, y = lat.pc_mean, 
+                 size=diversity, color=diversity))+
+  theme(legend.position = "right") + 
+  scale_fill_viridis_d("More expected cases") + 
+  scale_color_viridis_c("Diversity")+
+  scale_size(guide='none')
+
+ggplot() +
+  theme_void() +
+  geom_sf(data=map_sf.shp,aes(fill=V1>=0), color = 'gray', alpha = .4) +
+  geom_sf(data=map_sf.center,aes(size=var,color=sqrt(var)),alpha=0.8) +
+  theme(legend.position = "right") + 
+  scale_fill_viridis_d("More expected cases") + 
+  scale_color_viridis_c("STDEV")+
+  scale_size(guide='none')
+
+
+## Voorbeeld Aalst
+aalst <- as_tibble(div_matrix[199,],rownames=NA) %>% 
+  filter(!is.na(value)) %>% 
+  rownames_to_column(var="practice_id")
+aalst_practice <- aalst %>% 
+  left_join(practice_re,by="practice_id")
+
+aalst_map <- map_sf.shp %>% 
+  mutate(aalst = ifelse(NISCODE==41002,"Aalst","Not Aalst"))
+ggplot() +
+  theme_void() +
+  geom_sf(data=aalst_map,aes(fill=aalst), color = 'gray', alpha = .8)+
+  geom_point(data = aalst_practice,alphe=0.8,
+             aes(x = lon.pc_mean, y = lat.pc_mean, 
+                 size=value, color=value))+
+  theme(legend.position = "right") + 
+  scale_fill_manual("",values=c("Red","White")) +
+  scale_size(guide='none')
+
+
+## Voorbeeld hoeilaart
+hoeilaart <- as_tibble(div_matrix[79,],rownames=NA) %>% 
+  filter(!is.na(value)) %>% 
+  rownames_to_column(var="practice_id")
+hoeilaart_practice <- hoeilaart %>% 
+  left_join(practice_re,by="practice_id")
+
+hoeilaart_map <- map_sf.shp %>% 
+  mutate(hoeilaart = ifelse(NISCODE==23033,"hoeilaart","Not hoeilaart"))
+ggplot() +
+  theme_void() +
+  geom_sf(data=hoeilaart_map,aes(fill=hoeilaart), color = 'gray', alpha = .8)+
+  geom_point(data = hoeilaart_practice,alpha=0.8,
+             aes(x = lon.pc_mean, y = lat.pc_mean, 
+                 size=value, color=value))+
+  theme(legend.position = "right") + 
+  scale_fill_manual("",values=c("Red","White")) +
+  scale_size(guide='none')
+
+## Hoeilart praktijk 
+hoeilaart_practice <- as_tibble(div_matrix[,"1686d7d9-8650-11e6-93e4-0050568a1344"],rownames=NA) %>% 
+  rownames_to_column(var="ID") %>% 
+  mutate(ID=as.integer(ID)) %>% 
+  filter(!is.na(value)) 
+
+hoeilaart_practice_map <- map_sf.shp %>% 
+  select(1:11) %>% 
+  left_join(hoeilaart_practice,by="ID")
+
+hoeilaart_practice_map<-st_centroid(hoeilaart_practice_map)
+ggplot() +
+  theme_void() +
+  geom_sf(data=map_sf.shp,color="gray")+
+  geom_sf(data=hoeilaart_practice_map,aes(size=value,color=value), alpha = .8)+
+  geom_point(data = practice_re %>% filter(practice_id=="1686d7d9-8650-11e6-93e4-0050568a1344"),alpha=0.8,
+             aes(x = lon.pc_mean, y = lat.pc_mean),color="red")+
+  theme(legend.position = "right") + 
+  scale_size(guide='none')
+
+
+
+## Voorbeeld antwerp
+antwerp <- as_tibble(div_matrix[2,],rownames=NA) %>% 
+  filter(!is.na(value)) %>% 
+  rownames_to_column(var="practice_id")
+antwerp_practice <- antwerp %>% 
+  left_join(practice_re,by="practice_id")
+
+antwerp_map <- map_sf.shp %>% 
+  mutate(antwerp = ifelse(NISCODE==11002,"antwerp","Not antwerp"))
+ggplot() +
+  theme_void() +
+  geom_sf(data=antwerp_map,aes(fill=antwerp), color = 'gray', alpha = .8)+
+  geom_point(data = antwerp_practice,alpha=0.8,
+             aes(x = lon.pc_mean, y = lat.pc_mean, 
+                 size=value, color=value))+
+  theme(legend.position = "right") + 
+  scale_fill_manual("",values=c("Red","White")) +
+  scale_size(guide='none')
+
+
+
+
+## Voorbeeld diskmuide
+diskmuide <- as_tibble(div_matrix[145,],rownames=NA) %>% 
+  filter(!is.na(value)) %>% 
+  rownames_to_column(var="practice_id")
+diskmuide_practice <- diskmuide %>% 
+  left_join(practice_re,by="practice_id")
+
+diskmuide_map <- map_sf.shp %>% 
+  mutate(diskmuide = ifelse(NISCODE==32003,"diskmuide","Not diskmuide"))
+ggplot() +
+  theme_void() +
+  geom_sf(data=diskmuide_map,aes(fill=diskmuide), color = 'gray', alpha = .8)+
+  geom_point(data = diskmuide_practice,alpha=0.8,
+             aes(x = lon.pc_mean, y = lat.pc_mean, 
+                 size=value, color=value))+
+  theme(legend.position = "right") + 
+  scale_fill_manual("",values=c("Red","White")) +
+  scale_size(guide='none')
+
+## Hoeilart praktijk 
+diskmuide_practice <- as_tibble(div_matrix[,"dcc4d439-d0f0-4e3c-bc89-06447c01143e"],rownames=NA) %>% 
+  rownames_to_column(var="ID") %>% 
+  mutate(ID=as.integer(ID)) %>% 
+  filter(!is.na(value)) 
+
+diskmuide_practice_map <- map_sf.shp %>% 
+  select(1:11) %>% 
+  left_join(diskmuide_practice,by="ID")
+
+diskmuide_practice_map<-st_centroid(diskmuide_practice_map)
+ggplot() +
+  theme_void() +
+  geom_sf(data=map_sf.shp,color="gray")+
+  geom_sf(data=diskmuide_practice_map,aes(size=value,color=value), alpha = .8)+
+  geom_point(data = practice_re %>% filter(practice_id=="dcc4d439-d0f0-4e3c-bc89-06447c01143e"),alpha=0.8,
+             aes(x = lon.pc_mean, y = lat.pc_mean),color="red")+
+  theme(legend.position = "right") + 
+  scale_size(guide='none')
+
+
+## Correlation 
+nis_id <- map.shp@data %>% select(NISCODE,ID)
+ant <- sim_est_odds$nis[2,,"mean"]
+other <- sim_est_odds$nis[1,,"mean"]
+cor(ant,other)
+
+cor_matrix=cor(t(sim_est_odds$nis[,,"mean"]))
+
+com <- 2
+plot(cor_matrix[,com])
+
+d=st_distance(map_sf.center)
+hist(d[,com])
+d_cat<-Fisher_bin(d[,com],num_bin=5)    
+
+test <- tibble(corr=cor_matrix[,com],dist=d_cat)
+
+ggplot(test,aes(x=1:300,y=corr,color=dist))+
+  geom_point()+
+  labs(title=map.shp@data %>% filter(ID==com) %>% pull(NAAM))
+
+# Practice corr
+ant <- sim_est_odds$practice[2,,"mean"]
+other <- sim_est_odds$practice[1,,"mean"]
+cor(ant,other)
+
+cor_matrix=cor(t(sim_est_odds$practice[,,"mean"]))
+hist(cor_matrix)
+
+plot(cor_matrix[,1])
+for(com in 2:105){
+  plot(cor_matrix[,com],add=T)
+}
+
+d=st_distance(map_sf.center)
+hist(d[,com])
+d_cat<-Fisher_bin(d[,com],num_bin=5)    
+
+test <- tibble(corr=cor_matrix[,com],dist=d_cat)
+
+ggplot(test,aes(x=1:300,y=corr,color=dist))+
+  geom_point()+
+  labs(title=map.shp@data %>% filter(ID==com) %>% pull(NAAM))
