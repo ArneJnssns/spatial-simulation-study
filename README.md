@@ -1,7 +1,7 @@
 # simulation-study
 Simulation study to investigate the interplay between practice effects and spatial effect.
 
-In Feb. 2023, the repository was updated to include the latest code (input data). 
+In Feb. 2023, the repository was updated to include the latest code for initial analysis, simulation of datasets and code to use on the HPC. 
 
 Since this is my first time using GitHub for a project, here are a few links to interesting readings/instructions on how to use Git and GitHub with R:
 - [How to use Git/GitHub with R](https://rfortherestofus.com/2021/02/how-to-use-git-github-with-r/)
