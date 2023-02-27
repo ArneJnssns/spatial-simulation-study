@@ -109,8 +109,10 @@ ggplot(data = fl_sir, aes(fill=SIR))+
         panel.grid = element_blank(),
         axis.text = element_blank(),
         axis.ticks = element_blank())+
-  scale_fill_brewer(palette = "RdYlGn", direction = -1)   # , breaks = c(0,0.5,0.6,0.8,1.2,1.5,2,25))
-  # labs(title = "SIR of LRTI in 2019")
+  scale_fill_brewer(palette = "RdYlGn", 
+                    direction = -1,
+                    guide = guide_legend(reverse=TRUE))   # , breaks = c(0,0.5,0.6,0.8,1.2,1.5,2,25))
+  labs(title = "SIR of LRTI in 2019")
 # dev.off()
 
 # Save the figure by making a sscreenshot (better quality)
