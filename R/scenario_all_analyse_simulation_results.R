@@ -185,8 +185,8 @@ ggplot(data = sp_mae %>%
   # geom_hline(aes(yintercept = simula), size=1)+
   facet_wrap(~sd_spatial_label, scales = "fixed", 
              labeller = label_parsed)+
-  labs(x=expression(bold(sigma[practice])),
-       y=expression(mae[u[i]]),
+  labs(x=expression(bold(sigma[v])),
+       y=expression(MAE[U(x)]),
        #title="Boxplot of MAE spatial effect (N=150)"
   )+
   scale_color_manual("",values = c)+
@@ -342,7 +342,7 @@ ggplot(data = sd_id_all %>%
   geom_hline(aes(yintercept = sd_spatial), size=1)+
   facet_wrap(~sd_spatial_label, scales = "free",  
              labeller = label_parsed)+
-  labs(x=expression(bold(sigma[practice])),
+  labs(x=expression(bold(sigma[v])),
        y=expression(hat(sigma)[u]),
        title=""
   )+
