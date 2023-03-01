@@ -246,7 +246,7 @@ plot_random_effects <- function(re_estimates, n_re=2, map=TRUE, plot_map){
       if(re == "practice_id"){
         
         # load pracitce locations 
-        practice_coordinates <- read.csv("/Users/u0121893/OneDrive - KU Leuven/PhD/Research/Simulation/Spatial/data_extra/practice_location.csv")
+        practice_coordinates <- read.csv("/Users/u0121893/OneDrive - KU Leuven/phd/projects/simulation/spatial/github-repo/data/practice_location.csv")
         practice_re <- practice_coordinates %>% 
           left_join(re_estimates$practice_id,by=c("practice_id"="param"))
         
@@ -257,7 +257,7 @@ plot_random_effects <- function(re_estimates, n_re=2, map=TRUE, plot_map){
           geom_point(data = practice_re, aes(x = lon.pc_mean, y = lat.pc_mean,size=abs(mean),colour=mean), alpha = 0.8)+
           theme(legend.position = "right",
                 plot.margin = margin(.5,.5,.5,.5, unit="cm")) + 
-          scale_colour_continuous(expression(practice[k]),type="viridis") + 
+          scale_colour_continuous(expression(V(z)),type="viridis") + 
           scale_size(guide='none')#+
         # labs(title="Practice Random Effect (Odds ratio)")
         
@@ -268,7 +268,7 @@ plot_random_effects <- function(re_estimates, n_re=2, map=TRUE, plot_map){
         pre[[re]] <- ggplot(data = map_sf.shp %>% left_join(re_estimates[[re]],by=c("ID"="param")))+
           theme_void()+
           geom_sf(aes(fill=mean))+
-          scale_fill_continuous(expression(u[i]),type="viridis")+
+          scale_fill_continuous(expression(U(x)),type="viridis")+
           theme(plot.margin = margin(.5,.5,.5,.5, unit="cm"))
         #labs(title="Community Random Effect (Odds ratio)")
       }else{
